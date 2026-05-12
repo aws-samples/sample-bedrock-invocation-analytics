@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
 # Start Bedrock Analytics WebUI
 # Usage: ./start-webui.sh [--profile PROFILE] [--region REGION]
 # Reads defaults from .env.deploy if available.

@@ -4,6 +4,8 @@
 
 Amazon Bedrock 实时分析 — 监控多账户的 Token 用量、成本和性能。
 
+> ⚠️ 本示例仅用于演示用途，不适合用于生产环境。使用风险自负。
+
 ## 功能
 - 概览卡片：调用次数、输入/输出 Token、缓存 Token、预估成本、平均延迟、平均 TPOT
 - 按模型和调用者的 Token 用量与成本（图表 / 饼图 / 表格视图），成本按 Token 类型分拆（输入 / 输出 / 缓存读 / 缓存写)
@@ -209,3 +211,11 @@ AWS_DEFAULT_REGION=us-west-2 python3 scripts/seed_pricing.py \
 - **合计：约 $3/月**
 
 成本对调用次数是亚线性增长 —— Firehose 缓冲摊薄每记录开销,Iceberg 分区裁剪随历史增长仍保持较小扫描量。
+
+## 安全
+
+参见 [CONTRIBUTING](../CONTRIBUTING.md#security-issue-notifications)。
+
+## 许可证
+
+本项目使用 MIT-0 许可证,参见 [LICENSE](../LICENSE) 文件。

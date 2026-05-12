@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 """CDK app entry point. Reads config.yaml to instantiate Hub and Spoke stacks."""
 
 import yaml

@@ -1,3 +1,5 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 """
 Lambda: Sync Bedrock model pricing from LiteLLM.
 Triggered weekly by EventBridge. Compares current effective price with LiteLLM;

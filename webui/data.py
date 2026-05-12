@@ -1,3 +1,5 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 """DynamoDB data access for WebUI."""
 
 import os
@@ -122,7 +124,7 @@ def query_usage(account_region: str, granularity: str, start: str, end: str, dim
     """Query usage stats for a given account#region and time range.
 
     Args:
-        account_region: e.g. "222829864634#us-west-2"
+        account_region: e.g. "123456789012#us-west-2"
         granularity: "HOURLY", "DAILY", or "MONTHLY"
         start: start period, e.g. "2026-03-23T00" for HOURLY
         end: end period (inclusive bound)

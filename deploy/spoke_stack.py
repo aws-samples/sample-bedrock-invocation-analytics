@@ -1,3 +1,5 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 """CDK Spoke Stack: S3 + Bedrock logging + ETL Lambda (writes to Hub DynamoDB)."""
 
 from aws_cdk import (

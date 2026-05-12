@@ -1,3 +1,5 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 """
 Lambda L2: Read usage events from Iceberg, compute cost, aggregate into DDB.
 

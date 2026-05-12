@@ -4,6 +4,8 @@ English | [中文](docs/README_CN.md)
 
 Real-time analytics for Amazon Bedrock — monitor token usage, costs, and performance across AWS accounts.
 
+> ⚠️ This sample is for demonstration purposes only and is not intended for production use. Use at your own risk.
+
 ## Features
 - Summary cards: invocations, input/output tokens, cache tokens, estimated cost, avg latency, avg TPOT
 - Token usage & cost by model and by caller (chart / pie / table views) with per-token-type cost breakdown (input / output / cache read / cache write)
@@ -209,3 +211,11 @@ Open http://localhost:8060 in your browser.
 - **Total: ~$3/month**
 
 Costs scale sub-linearly with invocations — Firehose buffering amortizes per-record overhead, and Iceberg partition pruning keeps Athena scans small as history grows.
+
+## Security
+
+See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+
+## License
+
+This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file.

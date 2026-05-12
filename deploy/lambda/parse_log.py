@@ -1,3 +1,5 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 """
 Lambda L1: Parse Bedrock invocation log files from S3 and forward events to Firehose.
 

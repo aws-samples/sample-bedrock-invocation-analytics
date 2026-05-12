@@ -1,3 +1,5 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 """Seed DynamoDB pricing table from LiteLLM model_prices JSON."""
 
 import json

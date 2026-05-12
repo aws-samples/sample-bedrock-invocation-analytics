@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
 # Deploy Bedrock Invocation Analytics
 # Usage:
 #   ./deploy.sh hub [cdk-options]         Deploy primary account stack
