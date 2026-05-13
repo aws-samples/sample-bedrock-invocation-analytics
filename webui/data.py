@@ -67,7 +67,7 @@ def _load_config_names() -> dict[str, str]:
     if not cfg_path.exists():
         return {}
     try:
-        with open(cfg_path) as f:
+        with open(cfg_path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
     except Exception as e:
         print(f"[WARN] Failed to read config.yaml: {e}")

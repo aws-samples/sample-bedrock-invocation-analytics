@@ -206,13 +206,13 @@ def aggregate_event(ev):
 
     for dim in dims:
         sk = f"HOURLY#{hour_key}#{dim}"
-        update_expr_parts = [
+        update_expr_add = (
             "ADD invocations :one, input_tokens :inp, output_tokens :out, "
             "cache_read_tokens :cr, cache_write_tokens :cw, "
             "cost_micro_usd :cost, cost_input_micro :ci, cost_output_micro :co, "
             "cost_cache_read_micro :ccr, cost_cache_write_micro :ccw, "
             "latency_sum_ms :lat"
-        ]
+        )
         expr_values = {
             ":one": {"N": "1"},
             ":inp": {"N": str(input_tokens)},
@@ -228,10 +228,10 @@ def aggregate_event(ev):
             ":ttl": {"N": str(agg_ttl)},
         }
         if has_tpot:
-            update_expr_parts[0] += ", tpot_sum :tpot, tpot_count :one"
+            update_expr_add += ", tpot_sum :tpot, tpot_count :one"
             expr_values[":tpot"] = {"N": str(tpot_micro)}
 
-        update_expr = "\n".join(update_expr_parts) + " SET #ttl = if_not_exists(#ttl, :ttl)"
+        update_expr = update_expr_add + " SET #ttl = if_not_exists(#ttl, :ttl)"
         transact_items.append({
             "Update": {
                 "TableName": USAGE_STATS_TABLE,

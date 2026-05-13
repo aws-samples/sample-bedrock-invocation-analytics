@@ -8,7 +8,7 @@ import aws_cdk as cdk
 from hub_stack import HubStack
 from spoke_stack import SpokeStack
 
-with open("../config.yaml") as f:
+with open("../config.yaml", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
 accounts = config.get("accounts", [])
