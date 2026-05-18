@@ -1077,7 +1077,7 @@ wheels = [
 
 [[package]]
 name = "sample-bedrock-invocation-analytics"
-version = "3.4.0"
+version = "3.4.1"
 source = { virtual = "." }
 dependencies = [
     { name = "aws-cdk-lib" },

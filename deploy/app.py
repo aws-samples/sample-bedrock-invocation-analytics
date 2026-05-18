@@ -20,12 +20,25 @@ spokes = [a for a in accounts if not a.get("primary")]
 app = cdk.App()
 target = app.node.try_get_context("target")  # "hub", "spoke:<profile>", "all"
 
-# Hub stack
+# Hub stack — spoke_accounts come straight from config.yaml. Trust policies on the
+# cross-account SpokeWriteRole derive from this list, so any spoke listed (and reachable
+# via STS) gets baked in. Don't hand-pass it via context — that drifted us last time.
+spoke_account_ids: list[str] = []
+for s in spokes:
+    try:
+        import boto3
+        spoke_account_ids.append(
+            boto3.Session(profile_name=s["profile"]).client("sts").get_caller_identity()["Account"]
+        )
+    except Exception as e:
+        print(f"[WARN] Skipping spoke {s.get('profile')}: can't resolve account_id ({e})")
+
 data_config = config.get("data") or {}
 if not target or target == "hub" or target == "all":
     HubStack(app, "BedrockInvocationAnalytics",
         env=cdk.Environment(region=primary["region"]),
         cost_agg_interval_min=int(data_config.get("cost_agg_interval_min", 5)),
+        spoke_accounts=spoke_account_ids,
     )
 
 # Spoke stacks

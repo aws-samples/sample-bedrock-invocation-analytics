@@ -99,19 +99,19 @@ def _short_model(model: str) -> str:
 
 def _fetch_dashboard_data(account_region: str, start_dt: datetime, end_dt: datetime, tz: ZoneInfo) -> dict:
     """All boto3/DDB queries in one place. Runs on a worker thread.
-    Period strings on trend rows are localized to `tz` before returning, so chart x-axis
-    labels match the user's selected display timezone.
+    `tz` shapes get_trend's bucketing so the trend series has tz-aligned, equal-spaced
+    buckets (the in-progress bucket — today/this month — is synthesised from finer rows).
     """
     return {
         "summary": data.get_summary(account_region, start_dt, end_dt),
         "models": data.get_by_model(account_region, start_dt, end_dt),
         "callers": data.get_by_caller(account_region, start_dt, end_dt),
-        "trend_total": _localize_periods(data.get_trend(account_region, start_dt, end_dt, "TOTAL"), tz),
+        "trend_total": data.get_trend(account_region, start_dt, end_dt, "TOTAL", tz),
     }
 
 
 def _fetch_trend(account_region: str, start_dt: datetime, end_dt: datetime, dim: str, tz: ZoneInfo) -> list[dict]:
-    return _localize_periods(data.get_trend(account_region, start_dt, end_dt, dim), tz)
+    return data.get_trend(account_region, start_dt, end_dt, dim, tz)
 
 
 def _fetch_ttft(model_id: str, start_dt: datetime, end_dt: datetime, tz: ZoneInfo) -> list[dict]:

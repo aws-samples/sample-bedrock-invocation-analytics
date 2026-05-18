@@ -66,6 +66,7 @@ class HubStack(Stack):
 
     def __init__(self, scope: Construct, id: str,
                  cost_agg_interval_min: int = 5,
+                 spoke_accounts: list[str] | None = None,
                  **kwargs):
         super().__init__(scope, id, **kwargs)
 
@@ -610,8 +611,11 @@ class HubStack(Stack):
         self.model_pricing_table = model_pricing_table
 
         # ── IAM Role for Spoke Lambdas (cross-account) ──
-        spoke_accounts_str = self.node.try_get_context("spoke_accounts") or ""
-        spoke_accounts = [a for a in spoke_accounts_str.split(",") if a]
+        # Source of truth: app.py reads config.yaml and passes spoke_accounts directly.
+        # Context override stays as a fallback for ad-hoc CLI use.
+        if not spoke_accounts:
+            ctx_str = self.node.try_get_context("spoke_accounts") or ""
+            spoke_accounts = [a for a in ctx_str.split(",") if a]
         if spoke_accounts:
             spoke_write_role = iam.Role(self, "SpokeWriteRole",
                 role_name="BedrockAnalytics-SpokeWriteRole",

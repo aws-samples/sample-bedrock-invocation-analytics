@@ -3,7 +3,7 @@
 """DynamoDB data access for WebUI."""
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 
 import boto3
@@ -275,10 +275,104 @@ def get_by_caller(account_region: str, start_dt: datetime, end_dt: datetime) -> 
     return sorted(callers.values(), key=lambda x: x["cost_usd"], reverse=True)
 
 
-def get_trend(account_region: str, start_dt: datetime, end_dt: datetime, dimension: str = "TOTAL") -> list[dict]:
-    """Get time-series trend data per period."""
+def get_trend(account_region: str, start_dt: datetime, end_dt: datetime,
+              dimension: str = "TOTAL", tz: tzinfo | None = None) -> list[dict]:
+    """Get a contiguous time-series in a single display granularity.
+
+    Internally this queries the underlying mixed-granularity buckets via _plan_segments
+    and rolls them up to one target granularity (auto-picked from span). This means a
+    "This Year" view always returns equally-spaced monthly buckets — including a synthesised
+    bucket for the current month built from its DAILY+HOURLY rows. Storage stays sparse;
+    nothing here is persisted.
+
+    Bucketing is done in `tz` (defaulting to UTC) so the user-facing month/day boundaries
+    match what the user selected. DAILY/MONTHLY raw rows have no sub-day precision, so they
+    are attributed to the tz-day/tz-month containing their UTC start instant — at most an
+    8-hour edge offset for tz like Asia/Singapore, which is the standard tradeoff for
+    UTC-bucketed storage.
+    """
+    target = _pick_display_granularity(start_dt, end_dt)
     items = query_usage(account_region, _plan_segments(start_dt, end_dt), dimension)
-    return sorted(items, key=lambda x: x["period"])
+    return _rebucket(items, target, tz or timezone.utc)
+
+
+def _pick_display_granularity(start_dt: datetime, end_dt: datetime) -> str:
+    span_days = (end_dt - start_dt).total_seconds() / 86400
+    if span_days <= 2:
+        return "HOURLY"
+    if span_days <= 90:
+        return "DAILY"
+    return "MONTHLY"
+
+
+def _bucket_key(period: str, src_granularity: str, target: str, tz: tzinfo) -> str:
+    """Map a raw row's period to its target-granularity key in `tz`.
+
+    Raw periods are UTC strings: 'YYYY-MM-DDTHH', 'YYYY-MM-DD', 'YYYY-MM'.
+    We parse to a UTC instant (start-of-bucket), shift to tz, then truncate.
+    """
+    if src_granularity == "HOURLY":
+        dt = datetime.strptime(period, "%Y-%m-%dT%H").replace(tzinfo=timezone.utc)
+    elif src_granularity == "DAILY":
+        dt = datetime.strptime(period, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    elif src_granularity == "MONTHLY":
+        dt = datetime.strptime(period, "%Y-%m").replace(tzinfo=timezone.utc)
+    else:
+        return period
+
+    local = dt.astimezone(tz)
+    if target == "HOURLY":
+        return local.strftime("%Y-%m-%dT%H")
+    if target == "DAILY":
+        return local.strftime("%Y-%m-%d")
+    return local.strftime("%Y-%m")
+
+
+def _rebucket(rows: list[dict], target: str, tz: tzinfo) -> list[dict]:
+    """Aggregate mixed-granularity rows into a single-granularity series, grouped by tz.
+
+    Same per-field rules as the rollup lambda (sum / max / min, recompute averages).
+    Output rows preserve the same keys as raw rows so chart code doesn't need to special-case.
+    """
+    if not rows:
+        return []
+
+    SUMMABLE = ("invocations", "input_tokens", "output_tokens", "cache_read_tokens",
+                "cache_write_tokens", "cost_micro_usd", "cost_input", "cost_output",
+                "cost_cache_read", "cost_cache_write", "latency_sum_ms",
+                "tpot_sum", "tpot_count", "ttft_avg", "ttft_p99")
+
+    groups: dict[str, dict] = {}
+    for row in rows:
+        key = _bucket_key(row.get("period", ""), row.get("granularity", ""), target, tz)
+        if not key:
+            continue
+        agg = groups.setdefault(key, {
+            "period": key,
+            "dimension": row.get("dimension", ""),
+            "max_latency_ms": 0, "min_latency_ms": 0,
+            "tpot_max": 0, "tpot_min": 0,
+            **{k: 0 for k in SUMMABLE},
+        })
+        for k in SUMMABLE:
+            agg[k] += row.get(k, 0)
+        agg["max_latency_ms"] = max(agg["max_latency_ms"], row.get("max_latency_ms", 0))
+        agg["tpot_max"] = max(agg["tpot_max"], row.get("tpot_max", 0))
+        for f in ("min_latency_ms", "tpot_min"):
+            v = row.get(f, 0)
+            if v > 0:
+                cur = agg[f]
+                agg[f] = v if cur == 0 else min(cur, v)
+
+    # Recompute derived averages and surface cost_usd from cost_micro_usd
+    out = []
+    for key in sorted(groups):
+        a = groups[key]
+        a["cost_usd"] = a["cost_micro_usd"] / 1_000_000
+        a["avg_latency_ms"] = round(a["latency_sum_ms"] / a["invocations"]) if a["invocations"] else 0
+        a["tpot_avg"] = round(a["tpot_sum"] / a["tpot_count"] / 1000, 2) if a["tpot_count"] else 0
+        out.append(a)
+    return out
 
 
 def _extract_dimension(sk: str) -> str:
@@ -386,9 +480,15 @@ def delete_pricing(model_id: str, effective_date: str):
 
 
 def _format_item(item: dict) -> dict:
-    """Convert DynamoDB item to clean dict."""
+    """Convert DynamoDB item to clean dict.
+
+    `granularity` is extracted from the SK and exposed so callers (e.g. _rebucket)
+    know whether `period` is "YYYY-MM-DDTHH" (HOURLY), "YYYY-MM-DD" (DAILY), or
+    "YYYY-MM" (MONTHLY) without re-parsing.
+    """
     sk = item["SK"]
     parts = sk.split("#", 2)
+    granularity = parts[0] if parts else ""
     period = parts[1] if len(parts) >= 2 else ""
     dimension = parts[2] if len(parts) >= 3 else ""
 
@@ -400,6 +500,7 @@ def _format_item(item: dict) -> dict:
     tpot_sum = int(item.get("tpot_sum", 0))
 
     return {
+        "granularity": granularity,
         "period": period,
         "dimension": dimension,
         "invocations": invocations,
