@@ -3,11 +3,52 @@
 """Bedrock Invocation Analytics WebUI — Dashboard."""
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from nicegui import app, context, ui
 from webui import data
 
 VERSION = ""  # Set by main.py
+
+
+# Time presets resolve in the server's local tz (datetime.now().astimezone()).
+# data.py converts to UTC at query time. Week starts Monday (ISO).
+PRESET_OPTIONS = {
+    "last_24h": "Last 24h",
+    "last_7d": "Last 7 days",
+    "last_30d": "Last 30 days",
+    "last_90d": "Last 90 days",
+    "today": "Today",
+    "this_week": "This Week",
+    "this_month": "This Month",
+    "this_quarter": "This Quarter",
+    "this_year": "This Year",
+    "custom": "Custom...",
+}
+
+
+def _resolve_preset(preset: str) -> tuple[datetime, datetime]:
+    now = datetime.now().astimezone()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if preset == "last_24h":
+        return now - timedelta(hours=24), now
+    if preset == "last_7d":
+        return now - timedelta(days=7), now
+    if preset == "last_30d":
+        return now - timedelta(days=30), now
+    if preset == "last_90d":
+        return now - timedelta(days=90), now
+    if preset == "today":
+        return today, now
+    if preset == "this_week":
+        return today - timedelta(days=today.weekday()), now
+    if preset == "this_month":
+        return today.replace(day=1), now
+    if preset == "this_quarter":
+        q_start_month = ((today.month - 1) // 3) * 3 + 1
+        return today.replace(month=q_start_month, day=1), now
+    if preset == "this_year":
+        return today.replace(month=1, day=1), now
+    raise ValueError(f"Unknown preset: {preset}")
 
 
 def format_number(n: int) -> str:
@@ -32,22 +73,22 @@ def _short_model(model: str) -> str:
     return model.replace("global.", "").replace("anthropic.", "").replace("meta.", "")[:25]
 
 
-def _fetch_dashboard_data(account_region: str, days: int) -> dict:
+def _fetch_dashboard_data(account_region: str, start_dt: datetime, end_dt: datetime) -> dict:
     """All boto3/DDB queries in one place. Runs on a worker thread."""
     return {
-        "summary": data.get_summary(account_region, days),
-        "models": data.get_by_model(account_region, days),
-        "callers": data.get_by_caller(account_region, days),
-        "trend_total": data.get_trend(account_region, days, "TOTAL"),
+        "summary": data.get_summary(account_region, start_dt, end_dt),
+        "models": data.get_by_model(account_region, start_dt, end_dt),
+        "callers": data.get_by_caller(account_region, start_dt, end_dt),
+        "trend_total": data.get_trend(account_region, start_dt, end_dt, "TOTAL"),
     }
 
 
-def _fetch_trend(account_region: str, days: int, dim: str) -> list[dict]:
-    return data.get_trend(account_region, days, dim)
+def _fetch_trend(account_region: str, start_dt: datetime, end_dt: datetime, dim: str) -> list[dict]:
+    return data.get_trend(account_region, start_dt, end_dt, dim)
 
 
-def _fetch_ttft(model_id: str, days: int) -> list[dict]:
-    return data.get_ttft_trend(model_id, days)
+def _fetch_ttft(model_id: str, start_dt: datetime, end_dt: datetime) -> list[dict]:
+    return data.get_ttft_trend(model_id, start_dt, end_dt)
 
 
 def _current_dim(model_sel, caller_sel) -> str:
@@ -70,9 +111,12 @@ def dashboard_page():
     ui.dark_mode(False)
 
     accounts = data.get_accounts()
+    _start, _end = _resolve_preset("last_7d")
     state = {
         "account": accounts[0]["key"] if accounts else "",
-        "days": 7,
+        "preset": "last_7d",
+        "start_dt": _start,
+        "end_dt": _end,
     }
 
     # Refs to UI elements that need incremental updates
@@ -152,11 +196,48 @@ def dashboard_page():
             label="Region",
         ).classes("w-full mt-2")
 
-        days_select = ui.select(
-            {1: "Last 24h", 7: "Last 7 days", 30: "Last 30 days", 90: "Last 90 days"},
-            value=state["days"],
+        range_select = ui.select(
+            PRESET_OPTIONS,
+            value=state["preset"],
             label="Time Range",
         ).classes("w-full mt-2")
+        # Shows the resolved [start, end] for the active range — useful for "This Month" etc.
+        range_label = ui.label("").classes("text-xs text-gray-400 mt-1")
+
+        # ── Custom range dialog ──
+        with ui.dialog() as custom_dialog, ui.card().classes("min-w-[420px]"):
+            ui.label("Custom Time Range").classes("text-lg font-semibold")
+            today_str = datetime.now().astimezone().strftime("%Y-%m-%d")
+            start_str = (datetime.now().astimezone() - timedelta(days=7)).strftime("%Y-%m-%d")
+            with ui.row().classes("w-full gap-2"):
+                custom_start = ui.input(label="Start date", value=start_str).props("type=date dense outlined").classes("flex-1")
+                custom_end = ui.input(label="End date", value=today_str).props("type=date dense outlined").classes("flex-1")
+            with ui.row().classes("w-full justify-end mt-4 gap-2"):
+                ui.button("Cancel", on_click=lambda: (custom_dialog.close(), range_select.set_value(state["preset"]))).props("flat")
+                ui.button("Apply", on_click=lambda: apply_custom_range()).props("color=primary")
+
+        def update_range_label():
+            s = state["start_dt"].strftime("%Y-%m-%d %H:%M")
+            e = state["end_dt"].strftime("%Y-%m-%d %H:%M")
+            range_label.text = f"{s} → {e}"
+
+        def apply_custom_range():
+            try:
+                tz = datetime.now().astimezone().tzinfo
+                s = datetime.strptime(custom_start.value, "%Y-%m-%d").replace(tzinfo=tz)
+                e = datetime.strptime(custom_end.value, "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=tz)
+            except (ValueError, TypeError):
+                ui.notify("Invalid date format", color="negative")
+                return
+            if s >= e:
+                ui.notify("Start must be before end", color="negative")
+                return
+            state["preset"] = "custom"
+            state["start_dt"] = s
+            state["end_dt"] = e
+            update_range_label()
+            custom_dialog.close()
+            asyncio.create_task(rebuild())
 
         # Serving layer — what this dashboard reads
         ui.input(value=data.USAGE_TABLE, label="Usage Table").props("readonly dense outlined").classes("w-full text-xs")
@@ -198,16 +279,15 @@ def dashboard_page():
             lbl.text = f"Data up to: {last_window_end}"
 
     async def rebuild():
-        """Full DOM rebuild — used when account/region/days change."""
+        """Full DOM rebuild — used when account/region/range change."""
         if refreshing["flag"]:
             return
         refreshing["flag"] = True
         refresh_btn.props("loading")
         try:
             state["account"] = f"{account_select.value}#{region_select.value}"
-            state["days"] = days_select.value or 7
             # 1. Fetch data off the event loop
-            dashboard_data = await asyncio.to_thread(_fetch_dashboard_data, state["account"], state["days"])
+            dashboard_data = await asyncio.to_thread(_fetch_dashboard_data, state["account"], state["start_dt"], state["end_dt"])
             # 2. Render UI on the main loop (required for NiceGUI context)
             refs["summary_labels"].clear()
             refs["charts"].clear()
@@ -215,7 +295,7 @@ def dashboard_page():
             refs["dim_selectors"].clear()
             content.clear()
             with content:
-                render_dashboard(state["account"], state["days"], dashboard_data, refs)
+                render_dashboard(state["account"], state["start_dt"], state["end_dt"], dashboard_data, refs)
             mark_updated()
         except Exception as e:
             ui.notify(f"Load failed: {e}", color="negative")
@@ -230,23 +310,27 @@ def dashboard_page():
         refreshing["flag"] = True
         refresh_btn.props("loading")
         try:
-            # Collect all queries needed for in-place update (trend charts follow their selectors)
-            dashboard_data = await asyncio.to_thread(_fetch_dashboard_data, state["account"], state["days"])
+            # Refreshing a rolling preset (e.g. "Last 24h") should advance the window.
+            # Calendar-aligned presets (today/this_week/...) also advance their end_dt to "now".
+            if state["preset"] != "custom":
+                state["start_dt"], state["end_dt"] = _resolve_preset(state["preset"])
+                update_range_label()
+            s, e = state["start_dt"], state["end_dt"]
+
+            dashboard_data = await asyncio.to_thread(_fetch_dashboard_data, state["account"], s, e)
 
             trend_data = {}
-            # usage_trend uses paired model+caller selectors
             pair = refs["dim_selectors"].get("usage_trend")
             if pair:
                 dim = _current_dim(*pair)
-                trend_data["usage_trend"] = await asyncio.to_thread(_fetch_trend, state["account"], state["days"], dim)
-            # latency_trend still uses a single model selector
+                trend_data["usage_trend"] = await asyncio.to_thread(_fetch_trend, state["account"], s, e, dim)
             sel = refs["model_selects"].get("latency_trend")
             lat_dim = (sel.value if sel else "TOTAL") or "TOTAL"
-            trend_data["latency_trend"] = await asyncio.to_thread(_fetch_trend, state["account"], state["days"], lat_dim)
+            trend_data["latency_trend"] = await asyncio.to_thread(_fetch_trend, state["account"], s, e, lat_dim)
 
             ttft_sel = refs["model_selects"].get("ttft_trend")
             ttft_model = ttft_sel.value if ttft_sel else ""
-            ttft_data = await asyncio.to_thread(_fetch_ttft, ttft_model, state["days"]) if ttft_model else []
+            ttft_data = await asyncio.to_thread(_fetch_ttft, ttft_model, s, e) if ttft_model else []
 
             _apply_updates(dashboard_data, trend_data, ttft_data, refs)
             mark_updated()
@@ -256,15 +340,26 @@ def dashboard_page():
             refreshing["flag"] = False
             refresh_btn.props(remove="loading")
 
+    def on_range_change(e):
+        preset = e.value
+        if preset == "custom":
+            custom_dialog.open()
+            return
+        state["preset"] = preset
+        state["start_dt"], state["end_dt"] = _resolve_preset(preset)
+        update_range_label()
+        asyncio.create_task(rebuild())
+
     account_select.on_value_change(lambda _: rebuild())
     region_select.on_value_change(lambda _: rebuild())
-    days_select.on_value_change(lambda _: rebuild())
+    range_select.on_value_change(on_range_change)
 
     # Initial render — data fetched synchronously on page load is fine
     state["account"] = f"{account_select.value}#{region_select.value}"
-    initial_data = _fetch_dashboard_data(state["account"], state["days"])
+    update_range_label()
+    initial_data = _fetch_dashboard_data(state["account"], state["start_dt"], state["end_dt"])
     with content:
-        render_dashboard(state["account"], state["days"], initial_data, refs)
+        render_dashboard(state["account"], state["start_dt"], state["end_dt"], initial_data, refs)
     mark_updated()
 
 
@@ -387,7 +482,7 @@ def _apply_ttft_trend(chart, t: list[dict]):
     chart.update()
 
 
-def render_dashboard(account_region: str, days: int, dashboard_data: dict, refs: dict):
+def render_dashboard(account_region: str, start_dt: datetime, end_dt: datetime, dashboard_data: dict, refs: dict):
     """Build DOM. All data must be pre-fetched in dashboard_data."""
     summary = dashboard_data["summary"]
     models = dashboard_data["models"]
@@ -594,7 +689,7 @@ def render_dashboard(account_region: str, days: int, dashboard_data: dict, refs:
                     usage_caller_select.value = "TOTAL"
                     usage_syncing["flag"] = False
                 dim = _current_dim(usage_model_select, usage_caller_select)
-                t = await asyncio.to_thread(_fetch_trend, account_region, days, dim)
+                t = await asyncio.to_thread(_fetch_trend, account_region, start_dt, end_dt, dim)
                 _apply_usage_trend(usage_chart, t)
 
             async def on_usage_caller_change(_):
@@ -605,7 +700,7 @@ def render_dashboard(account_region: str, days: int, dashboard_data: dict, refs:
                     usage_model_select.value = "TOTAL"
                     usage_syncing["flag"] = False
                 dim = _current_dim(usage_model_select, usage_caller_select)
-                t = await asyncio.to_thread(_fetch_trend, account_region, days, dim)
+                t = await asyncio.to_thread(_fetch_trend, account_region, start_dt, end_dt, dim)
                 _apply_usage_trend(usage_chart, t)
 
             usage_model_select.on_value_change(on_usage_model_change)
@@ -671,7 +766,7 @@ def render_dashboard(account_region: str, days: int, dashboard_data: dict, refs:
                     refs["model_selects"]["latency_trend"] = lat_model_select
 
                     async def on_lat_select_change(_):
-                        t = await asyncio.to_thread(_fetch_trend, account_region, days, lat_model_select.value or "TOTAL")
+                        t = await asyncio.to_thread(_fetch_trend, account_region, start_dt, end_dt, lat_model_select.value or "TOTAL")
                         _apply_latency_trend(lat_chart, t)
 
                     lat_model_select.on_value_change(on_lat_select_change)
@@ -703,7 +798,7 @@ def render_dashboard(account_region: str, days: int, dashboard_data: dict, refs:
                         mid = ttft_model_select.value or ""
                         if not mid:
                             return
-                        t = await asyncio.to_thread(_fetch_ttft, mid, days)
+                        t = await asyncio.to_thread(_fetch_ttft, mid, start_dt, end_dt)
                         _apply_ttft_trend(ttft_chart, t)
 
                     ttft_model_select.on_value_change(on_ttft_select_change)
@@ -711,7 +806,7 @@ def render_dashboard(account_region: str, days: int, dashboard_data: dict, refs:
                     if first_model:
                         # Initial TTFT load is async so the page render doesn't block on CloudWatch
                         async def _initial_ttft():
-                            t = await asyncio.to_thread(_fetch_ttft, first_model, days)
+                            t = await asyncio.to_thread(_fetch_ttft, first_model, start_dt, end_dt)
                             _apply_ttft_trend(ttft_chart, t)
                         ui.timer(0.01, _initial_ttft, once=True)
 

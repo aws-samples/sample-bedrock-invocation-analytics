@@ -3,7 +3,7 @@
 """DynamoDB data access for WebUI."""
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import boto3
@@ -25,28 +25,34 @@ _usage = _ddb.Table(USAGE_TABLE)
 _pricing = _ddb.Table(PRICING_TABLE)
 
 
-def _resolve_granularity(account_region: str, days: int):
-    """Pick granularity. Fallback to HOURLY if DAILY has no data (rollup hasn't run yet)."""
-    now = datetime.now(timezone.utc)
-    if days <= 1:
-        start = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H")
-        end = now.strftime("%Y-%m-%dT%H")
-        return "HOURLY", start, end
+def _resolve_granularity(account_region: str, start_dt: datetime, end_dt: datetime):
+    """Pick granularity for an arbitrary [start_dt, end_dt] window.
 
-    # Try DAILY first
-    start = (now - timedelta(days=days)).strftime("%Y-%m-%d")
-    end = now.strftime("%Y-%m-%d")
+    Both inputs are timezone-aware; we convert to UTC for DDB SK formatting. Span heuristic:
+    - <= 2 days  → HOURLY
+    - <= 90 days → DAILY (fall back to HOURLY if rollup hasn't run yet)
+    - >  90 days → MONTHLY
+    """
+    s_utc = start_dt.astimezone(timezone.utc)
+    e_utc = end_dt.astimezone(timezone.utc)
+    span_days = (e_utc - s_utc).total_seconds() / 86400
+
+    if span_days <= 2:
+        return "HOURLY", s_utc.strftime("%Y-%m-%dT%H"), e_utc.strftime("%Y-%m-%dT%H")
+
+    if span_days > 90:
+        return "MONTHLY", s_utc.strftime("%Y-%m"), e_utc.strftime("%Y-%m")
+
+    daily_start = s_utc.strftime("%Y-%m-%d")
+    daily_end = e_utc.strftime("%Y-%m-%d")
     resp = _usage.query(
-        KeyConditionExpression=Key("PK").eq(account_region) & Key("SK").between(f"DAILY#{start}", f"DAILY#{end}\xff"),
+        KeyConditionExpression=Key("PK").eq(account_region) & Key("SK").between(f"DAILY#{daily_start}", f"DAILY#{daily_end}\xff"),
         Limit=1,
     )
     if resp.get("Items"):
-        return "DAILY", start, end
+        return "DAILY", daily_start, daily_end
 
-    # Fallback to HOURLY
-    start = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H")
-    end = now.strftime("%Y-%m-%dT%H")
-    return "HOURLY", start, end
+    return "HOURLY", s_utc.strftime("%Y-%m-%dT%H"), e_utc.strftime("%Y-%m-%dT%H")
 
 
 def get_l2_checkpoint() -> dict | None:
@@ -145,9 +151,9 @@ def query_usage(account_region: str, granularity: str, start: str, end: str, dim
     return [_format_item(i, granularity) for i in items]
 
 
-def get_summary(account_region: str, days: int = 7) -> dict:
+def get_summary(account_region: str, start_dt: datetime, end_dt: datetime) -> dict:
     """Get summary stats for dashboard cards."""
-    g, start, end = _resolve_granularity(account_region, days)
+    g, start, end = _resolve_granularity(account_region, start_dt, end_dt)
     items = query_usage(account_region, g, start, end, "TOTAL")
 
     total = {"invocations": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.0, "latency_sum_ms": 0, "tpot_sum": 0, "tpot_count": 0}
@@ -162,9 +168,9 @@ def get_summary(account_region: str, days: int = 7) -> dict:
     return total
 
 
-def get_by_model(account_region: str, days: int = 7) -> list[dict]:
+def get_by_model(account_region: str, start_dt: datetime, end_dt: datetime) -> list[dict]:
     """Get usage grouped by model."""
-    g, start, end = _resolve_granularity(account_region, days)
+    g, start, end = _resolve_granularity(account_region, start_dt, end_dt)
 
     items = query_usage(account_region, g, start, end, "MODEL#")
 
@@ -193,9 +199,9 @@ def get_by_model(account_region: str, days: int = 7) -> list[dict]:
     return sorted(models.values(), key=lambda x: x["cost_usd"], reverse=True)
 
 
-def get_by_caller(account_region: str, days: int = 7) -> list[dict]:
+def get_by_caller(account_region: str, start_dt: datetime, end_dt: datetime) -> list[dict]:
     """Get usage grouped by caller."""
-    g, start, end = _resolve_granularity(account_region, days)
+    g, start, end = _resolve_granularity(account_region, start_dt, end_dt)
 
     items = query_usage(account_region, g, start, end, "CALLER#")
 
@@ -212,9 +218,9 @@ def get_by_caller(account_region: str, days: int = 7) -> list[dict]:
     return sorted(callers.values(), key=lambda x: x["cost_usd"], reverse=True)
 
 
-def get_trend(account_region: str, days: int = 7, dimension: str = "TOTAL") -> list[dict]:
+def get_trend(account_region: str, start_dt: datetime, end_dt: datetime, dimension: str = "TOTAL") -> list[dict]:
     """Get time-series trend data per period."""
-    g, start, end = _resolve_granularity(account_region, days)
+    g, start, end = _resolve_granularity(account_region, start_dt, end_dt)
 
     items = query_usage(account_region, g, start, end, dimension)
     return sorted(items, key=lambda x: x["period"])
@@ -269,18 +275,18 @@ def get_pricing_sync_info() -> dict | None:
 _cw = boto3.client("cloudwatch", region_name=AWS_REGION)
 
 
-def get_ttft_trend(model_id: str, days: int = 7) -> list[dict]:
+def get_ttft_trend(model_id: str, start_dt: datetime, end_dt: datetime) -> list[dict]:
     """Get TimeToFirstToken trend from CloudWatch for a model."""
-    now = datetime.now(timezone.utc)
-    period = 3600 if days <= 7 else 86400
+    span_days = (end_dt - start_dt).total_seconds() / 86400
+    period = 3600 if span_days <= 7 else 86400
     try:
         resp = _cw.get_metric_data(
             MetricDataQueries=[
                 {"Id": "avg", "MetricStat": {"Metric": {"Namespace": "AWS/Bedrock", "MetricName": "TimeToFirstToken", "Dimensions": [{"Name": "ModelId", "Value": model_id}]}, "Period": period, "Stat": "Average"}},
                 {"Id": "p99", "MetricStat": {"Metric": {"Namespace": "AWS/Bedrock", "MetricName": "TimeToFirstToken", "Dimensions": [{"Name": "ModelId", "Value": model_id}]}, "Period": period, "Stat": "p99"}},
             ],
-            StartTime=now - timedelta(days=days),
-            EndTime=now,
+            StartTime=start_dt.astimezone(timezone.utc),
+            EndTime=end_dt.astimezone(timezone.utc),
         )
     except Exception as e:
         print(f"[WARN] CloudWatch TTFT query failed: {e}")
