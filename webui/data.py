@@ -3,7 +3,7 @@
 """DynamoDB data access for WebUI."""
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import boto3
@@ -25,34 +25,92 @@ _usage = _ddb.Table(USAGE_TABLE)
 _pricing = _ddb.Table(PRICING_TABLE)
 
 
-def _resolve_granularity(account_region: str, start_dt: datetime, end_dt: datetime):
-    """Pick granularity for an arbitrary [start_dt, end_dt] window.
+def _plan_segments(start_dt: datetime, end_dt: datetime) -> list[tuple[str, str, str]]:
+    """Plan storage-tier segments for [start_dt, end_dt) — any input tz, output SKs are UTC.
 
-    Both inputs are timezone-aware; we convert to UTC for DDB SK formatting. Span heuristic:
-    - <= 2 days  → HOURLY
-    - <= 90 days → DAILY (fall back to HOURLY if rollup hasn't run yet)
-    - >  90 days → MONTHLY
+    The window is shaved progressively from both ends:
+      1. HOURLY head  — partial day at the start, until the next UTC midnight
+      2. DAILY head   — full UTC days, until the next UTC month boundary
+      3. MONTHLY      — full UTC months that are entirely within the window AND completed
+      4. DAILY tail   — full UTC days after the last completed month, until today (UTC) starts
+      5. HOURLY tail  — today's UTC hours up to e_utc
+
+    Each tier covers only the range it's allowed to (per the rollup contract: MONTHLY is
+    completed months only, DAILY is completed days only, today/in-progress hour is HOURLY).
+    Returns a chronological list of (granularity, sk_start, sk_end) — empty if invalid.
     """
-    s_utc = start_dt.astimezone(timezone.utc)
-    e_utc = end_dt.astimezone(timezone.utc)
-    span_days = (e_utc - s_utc).total_seconds() / 86400
+    s = start_dt.astimezone(timezone.utc)
+    e = end_dt.astimezone(timezone.utc)
+    if s >= e:
+        return []
 
-    if span_days <= 2:
-        return "HOURLY", s_utc.strftime("%Y-%m-%dT%H"), e_utc.strftime("%Y-%m-%dT%H")
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    cur_month_start = today_start.replace(day=1)
 
-    if span_days > 90:
-        return "MONTHLY", s_utc.strftime("%Y-%m"), e_utc.strftime("%Y-%m")
+    segments: list[tuple[str, str, str]] = []
+    cursor = s  # advances toward e
 
-    daily_start = s_utc.strftime("%Y-%m-%d")
-    daily_end = e_utc.strftime("%Y-%m-%d")
-    resp = _usage.query(
-        KeyConditionExpression=Key("PK").eq(account_region) & Key("SK").between(f"DAILY#{daily_start}", f"DAILY#{daily_end}\xff"),
-        Limit=1,
-    )
-    if resp.get("Items"):
-        return "DAILY", daily_start, daily_end
+    # ── 1. HOURLY head: from cursor up to the next UTC midnight (exclusive) ──
+    next_midnight = (cursor + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0) \
+        if (cursor.hour, cursor.minute, cursor.second, cursor.microsecond) != (0, 0, 0, 0) else cursor
+    if cursor < next_midnight:
+        head_end = min(next_midnight, e, today_start + timedelta(hours=1))  # don't cross today/end
+        segments.append(("HOURLY", cursor.strftime("%Y-%m-%dT%H"),
+                         (head_end - timedelta(hours=1)).strftime("%Y-%m-%dT%H")))
+        cursor = next_midnight
+        if cursor >= e:
+            return segments
 
-    return "HOURLY", s_utc.strftime("%Y-%m-%dT%H"), e_utc.strftime("%Y-%m-%dT%H")
+    # ── 2. DAILY head: full UTC days until the next month boundary (exclusive) or today ──
+    # Only run if cursor isn't already month-aligned — otherwise let MONTHLY take over.
+    if cursor.day != 1:
+        next_month = _next_month_start(cursor)
+        daily_head_end = min(next_month, today_start, e)
+        if cursor < daily_head_end:
+            segments.append(("DAILY", cursor.strftime("%Y-%m-%d"),
+                             (daily_head_end - timedelta(days=1)).strftime("%Y-%m-%d")))
+            cursor = daily_head_end
+            if cursor >= e:
+                return segments
+
+    # ── 3. MONTHLY: only complete months that ended before the current UTC month ──
+    monthly_upper = min(cur_month_start, e)  # exclusive
+    if cursor.day == 1 and cursor < monthly_upper:
+        # cursor is at a UTC month start; monthly_upper is also a month start (or e)
+        # Last fully-included month is monthly_upper - 1 day's month
+        last_full_month_start = (monthly_upper - timedelta(days=1)).replace(day=1)
+        if cursor <= last_full_month_start:
+            segments.append(("MONTHLY", cursor.strftime("%Y-%m"),
+                             last_full_month_start.strftime("%Y-%m")))
+            cursor = _next_month_start(last_full_month_start)
+            if cursor >= e:
+                return segments
+
+    # ── 4. DAILY tail: full UTC days from cursor up to today_start (exclusive) ──
+    daily_tail_end = min(today_start, e)
+    if cursor < daily_tail_end:
+        segments.append(("DAILY", cursor.strftime("%Y-%m-%d"),
+                         (daily_tail_end - timedelta(days=1)).strftime("%Y-%m-%d")))
+        cursor = daily_tail_end
+        if cursor >= e:
+            return segments
+
+    # ── 5. HOURLY tail: today's hours up to e ──
+    if cursor < e:
+        # e_hour_inclusive: include the hour containing e (so an end_dt like 12:50 hits SK ...T12)
+        last_hour_inclusive = e if (e.minute, e.second, e.microsecond) == (0, 0, 0) else e + timedelta(hours=1)
+        segments.append(("HOURLY", cursor.strftime("%Y-%m-%dT%H"),
+                         (last_hour_inclusive - timedelta(hours=1)).strftime("%Y-%m-%dT%H")))
+
+    return segments
+
+
+def _next_month_start(dt: datetime) -> datetime:
+    """First moment of the next UTC calendar month, after dt's month."""
+    base = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if base.month == 12:
+        return base.replace(year=base.year + 1, month=1)
+    return base.replace(month=base.month + 1)
 
 
 def get_l2_checkpoint() -> dict | None:
@@ -126,35 +184,38 @@ def get_accounts() -> list[dict]:
     return results
 
 
-def query_usage(account_region: str, granularity: str, start: str, end: str, dimension_prefix: str = "") -> list[dict]:
-    """Query usage stats for a given account#region and time range.
+def query_usage(account_region: str, segments: list[tuple[str, str, str]], dimension_prefix: str = "") -> list[dict]:
+    """Query usage stats across one or more storage-tier segments and concatenate results.
 
     Args:
         account_region: e.g. "123456789012#us-west-2"
-        granularity: "HOURLY", "DAILY", or "MONTHLY"
-        start: start period, e.g. "2026-03-23T00" for HOURLY
-        end: end period (inclusive bound)
+        segments: list of (granularity, sk_start, sk_end) — see _plan_segments()
         dimension_prefix: filter SK by dimension, e.g. "MODEL#", "CALLER#", "TOTAL"
     """
-    sk_start = f"{granularity}#{start}"
-    sk_end = f"{granularity}#{end}\xff"
+    out = []
+    for granularity, start, end in segments:
+        sk_start = f"{granularity}#{start}"
+        sk_end = f"{granularity}#{end}\xff"
 
-    resp = _usage.query(
-        KeyConditionExpression=Key("PK").eq(account_region) & Key("SK").between(sk_start, sk_end),
-    )
-    items = resp.get("Items", [])
+        items: list[dict] = []
+        kwargs = {"KeyConditionExpression": Key("PK").eq(account_region) & Key("SK").between(sk_start, sk_end)}
+        while True:
+            resp = _usage.query(**kwargs)
+            items.extend(resp.get("Items", []))
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
 
-    # Client-side filter by dimension
-    if dimension_prefix:
-        items = [i for i in items if _extract_dimension(i["SK"]).startswith(dimension_prefix)]
+        if dimension_prefix:
+            items = [i for i in items if _extract_dimension(i["SK"]).startswith(dimension_prefix)]
 
-    return [_format_item(i, granularity) for i in items]
+        out.extend(_format_item(i) for i in items)
+    return out
 
 
 def get_summary(account_region: str, start_dt: datetime, end_dt: datetime) -> dict:
     """Get summary stats for dashboard cards."""
-    g, start, end = _resolve_granularity(account_region, start_dt, end_dt)
-    items = query_usage(account_region, g, start, end, "TOTAL")
+    items = query_usage(account_region, _plan_segments(start_dt, end_dt), "TOTAL")
 
     total = {"invocations": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.0, "latency_sum_ms": 0, "tpot_sum": 0, "tpot_count": 0}
     for item in items:
@@ -170,9 +231,7 @@ def get_summary(account_region: str, start_dt: datetime, end_dt: datetime) -> di
 
 def get_by_model(account_region: str, start_dt: datetime, end_dt: datetime) -> list[dict]:
     """Get usage grouped by model."""
-    g, start, end = _resolve_granularity(account_region, start_dt, end_dt)
-
-    items = query_usage(account_region, g, start, end, "MODEL#")
+    items = query_usage(account_region, _plan_segments(start_dt, end_dt), "MODEL#")
 
     # Aggregate across time periods by model
     models = {}
@@ -201,9 +260,7 @@ def get_by_model(account_region: str, start_dt: datetime, end_dt: datetime) -> l
 
 def get_by_caller(account_region: str, start_dt: datetime, end_dt: datetime) -> list[dict]:
     """Get usage grouped by caller."""
-    g, start, end = _resolve_granularity(account_region, start_dt, end_dt)
-
-    items = query_usage(account_region, g, start, end, "CALLER#")
+    items = query_usage(account_region, _plan_segments(start_dt, end_dt), "CALLER#")
 
     callers = {}
     for item in items:
@@ -220,9 +277,7 @@ def get_by_caller(account_region: str, start_dt: datetime, end_dt: datetime) -> 
 
 def get_trend(account_region: str, start_dt: datetime, end_dt: datetime, dimension: str = "TOTAL") -> list[dict]:
     """Get time-series trend data per period."""
-    g, start, end = _resolve_granularity(account_region, start_dt, end_dt)
-
-    items = query_usage(account_region, g, start, end, dimension)
+    items = query_usage(account_region, _plan_segments(start_dt, end_dt), dimension)
     return sorted(items, key=lambda x: x["period"])
 
 
@@ -330,7 +385,7 @@ def delete_pricing(model_id: str, effective_date: str):
     _pricing.delete_item(Key={"PK": f"MODEL#{model_id}", "SK": effective_date})
 
 
-def _format_item(item: dict, granularity: str) -> dict:
+def _format_item(item: dict) -> dict:
     """Convert DynamoDB item to clean dict."""
     sk = item["SK"]
     parts = sk.split("#", 2)
