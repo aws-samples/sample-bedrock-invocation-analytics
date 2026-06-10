@@ -266,8 +266,8 @@ def get_by_caller(account_region: str, start_dt: datetime, end_dt: datetime) -> 
     for item in items:
         caller = item["dimension"].replace("CALLER#", "")
         if caller not in callers:
-            callers[caller] = {"caller": caller, "invocations": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "cost_input": 0.0, "cost_output": 0.0, "cost_cache_read": 0.0, "cost_cache_write": 0.0}
-        for k in ("invocations", "input_tokens", "output_tokens"):
+            callers[caller] = {"caller": caller, "invocations": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.0, "cost_input": 0.0, "cost_output": 0.0, "cost_cache_read": 0.0, "cost_cache_write": 0.0}
+        for k in ("invocations", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"):
             callers[caller][k] += item.get(k, 0)
         for k in ("cost_usd", "cost_input", "cost_output", "cost_cache_read", "cost_cache_write"):
             callers[caller][k] += item.get(k, 0.0)

@@ -417,6 +417,54 @@ def _set_series_data(chart, series_name, new_data):
             return
 
 
+# Token vs cost share a chart but mean different things (left axis = count, right axis = $).
+# Same colour per category for both; a diagonal `decal` hatch marks the $ (cost) bars so they
+# read apart from the solid token bars, plus a side-by-side stack each.
+_COST_DECAL = {"symbol": "line", "dashArrayX": [1, 0], "dashArrayY": [4, 3],
+               "rotation": -0.785, "color": "rgba(255,255,255,0.4)"}
+
+# One colour per token-category; usage and cost of the same category share it, so the eye can
+# pair "input tokens" with "input $". Texture (decal) tells usage from cost, not colour.
+_CAT_COLOR = {
+    "input": "#5070dd",        # blue
+    "cache_read": "#b6d634",   # green
+    "cache_write": "#f97317",  # orange
+    "output": "#01b7d4",       # cyan
+}
+
+
+def _usage_cost_bar_option(x_labels, input_tok, output_tok, cache_read_tok, cache_write_tok,
+                           cost_in, cost_out, cost_cr, cost_cw) -> dict:
+    """Three bars per x: an input-token stack, an output-token bar, and a cost stack.
+
+    Cache reads/writes are input-side tokens (prompt caching only caches input), so they
+    stack onto the input bar. Token bars carry a decal hatch to set them apart from the
+    solid cost bar (different axis / unit). Series names are stable for _apply_updates."""
+    return {
+        "tooltip": {"trigger": "axis"},
+        "legend": {"top": 0, "type": "scroll"},
+        "grid": {"top": 40, "bottom": 70, "left": 60, "right": 60},
+        "xAxis": {"type": "category", "data": x_labels, "axisLabel": {"rotate": 40, "interval": 0}},
+        "yAxis": [
+            {"type": "value", "name": "Tokens"},
+            {"type": "value", "name": "Cost ($)"},
+        ],
+        "series": [
+            # Bar 1: input-side tokens (input + cache read + cache write), stacked
+            {"name": "Input Tokens", "type": "bar", "stack": "tok_in", "itemStyle": {"color": _CAT_COLOR["input"]}, "data": input_tok},
+            {"name": "Cache Read Tokens", "type": "bar", "stack": "tok_in", "itemStyle": {"color": _CAT_COLOR["cache_read"]}, "data": cache_read_tok},
+            {"name": "Cache Write Tokens", "type": "bar", "stack": "tok_in", "itemStyle": {"color": _CAT_COLOR["cache_write"]}, "data": cache_write_tok},
+            # Bar 2: output tokens
+            {"name": "Output Tokens", "type": "bar", "stack": "tok_out", "itemStyle": {"color": _CAT_COLOR["output"]}, "data": output_tok},
+            # Bar 3: cost breakdown, stacked, right axis — same colour per category as its tokens, decal hatch marks these as the $ (cost) bars vs the solid token bars.
+            {"name": "Input $", "type": "bar", "stack": "cost", "yAxisIndex": 1, "itemStyle": {"color": _CAT_COLOR["input"], "decal": _COST_DECAL}, "data": cost_in},
+            {"name": "Cache Read $", "type": "bar", "stack": "cost", "yAxisIndex": 1, "itemStyle": {"color": _CAT_COLOR["cache_read"], "decal": _COST_DECAL}, "data": cost_cr},
+            {"name": "Cache Write $", "type": "bar", "stack": "cost", "yAxisIndex": 1, "itemStyle": {"color": _CAT_COLOR["cache_write"], "decal": _COST_DECAL}, "data": cost_cw},
+            {"name": "Output $", "type": "bar", "stack": "cost", "yAxisIndex": 1, "itemStyle": {"color": _CAT_COLOR["output"], "decal": _COST_DECAL}, "data": cost_out},
+        ],
+    }
+
+
 def _apply_updates(dashboard_data: dict, trend_data: dict, ttft_data: list, refs: dict):
     """Apply fetched data to existing UI elements (no DOM rebuild)."""
     summary = dashboard_data["summary"]
@@ -445,8 +493,9 @@ def _apply_updates(dashboard_data: dict, trend_data: dict, ttft_data: list, refs
     if "model_bar" in charts:
         ch = charts["model_bar"]
         ch.options["xAxis"]["data"] = model_names
-        for s, key in [("Input Tokens", "input_tokens"), ("Output Tokens", "output_tokens")]:
-            _set_series_data(ch, s, [m[key] for m in top_models])
+        for s, key in [("Input Tokens", "input_tokens"), ("Output Tokens", "output_tokens"),
+                       ("Cache Read Tokens", "cache_read_tokens"), ("Cache Write Tokens", "cache_write_tokens")]:
+            _set_series_data(ch, s, [m.get(key, 0) for m in top_models])
         for s, key in [("Cache Read $", "cost_cache_read"), ("Cache Write $", "cost_cache_write"),
                        ("Input $", "cost_input"), ("Output $", "cost_output")]:
             _set_series_data(ch, s, [round(m[key], 4) for m in top_models])
@@ -460,8 +509,9 @@ def _apply_updates(dashboard_data: dict, trend_data: dict, ttft_data: list, refs
     if "caller_bar" in charts:
         ch = charts["caller_bar"]
         ch.options["xAxis"]["data"] = caller_names
-        for s, key in [("Input Tokens", "input_tokens"), ("Output Tokens", "output_tokens")]:
-            _set_series_data(ch, s, [c[key] for c in top_callers])
+        for s, key in [("Input Tokens", "input_tokens"), ("Output Tokens", "output_tokens"),
+                       ("Cache Read Tokens", "cache_read_tokens"), ("Cache Write Tokens", "cache_write_tokens")]:
+            _set_series_data(ch, s, [c.get(key, 0) for c in top_callers])
         for s, key in [("Cache Read $", "cost_cache_read"), ("Cache Write $", "cost_cache_write"),
                        ("Input $", "cost_input"), ("Output $", "cost_output")]:
             _set_series_data(ch, s, [round(c[key], 4) for c in top_callers])
@@ -582,24 +632,17 @@ def render_dashboard(account_region: str, start_dt: datetime, end_dt: datetime, 
                         refs["charts"]["model_pie"] = pie_refs
                 with ui.tab_panel("chart").classes("p-2"):
                     model_names = [_short_model(m["model"]) for m in models[:15]]
-                    refs["charts"]["model_bar"] = ui.echart({
-                        "tooltip": {"trigger": "axis"},
-                        "legend": {"top": 0},
-                        "grid": {"top": 40, "bottom": 70, "left": 60, "right": 60},
-                        "xAxis": {"type": "category", "data": model_names, "axisLabel": {"rotate": 40, "interval": 0}},
-                        "yAxis": [
-                            {"type": "value", "name": "Tokens"},
-                            {"type": "value", "name": "Cost ($)"},
-                        ],
-                        "series": [
-                            {"name": "Input Tokens", "type": "bar", "data": [m["input_tokens"] for m in models[:15]]},
-                            {"name": "Output Tokens", "type": "bar", "data": [m["output_tokens"] for m in models[:15]]},
-                            {"name": "Cache Read $", "type": "bar", "stack": "cost", "yAxisIndex": 1, "itemStyle": {"color": "#06B6D4"}, "data": [round(m["cost_cache_read"], 4) for m in models[:15]]},
-                            {"name": "Cache Write $", "type": "bar", "stack": "cost", "yAxisIndex": 1, "itemStyle": {"color": "#8B5CF6"}, "data": [round(m["cost_cache_write"], 4) for m in models[:15]]},
-                            {"name": "Input $", "type": "bar", "stack": "cost", "yAxisIndex": 1, "itemStyle": {"color": "#3B82F6"}, "data": [round(m["cost_input"], 4) for m in models[:15]]},
-                            {"name": "Output $", "type": "bar", "stack": "cost", "yAxisIndex": 1, "itemStyle": {"color": "#F97316"}, "data": [round(m["cost_output"], 4) for m in models[:15]]},
-                        ],
-                    }).classes("w-full h-96")
+                    refs["charts"]["model_bar"] = ui.echart(_usage_cost_bar_option(
+                        model_names,
+                        [m["input_tokens"] for m in models[:15]],
+                        [m["output_tokens"] for m in models[:15]],
+                        [m["cache_read_tokens"] for m in models[:15]],
+                        [m["cache_write_tokens"] for m in models[:15]],
+                        [round(m["cost_input"], 4) for m in models[:15]],
+                        [round(m["cost_output"], 4) for m in models[:15]],
+                        [round(m["cost_cache_read"], 4) for m in models[:15]],
+                        [round(m["cost_cache_write"], 4) for m in models[:15]],
+                    )).classes("w-full h-96")
                 with ui.tab_panel("table"):
                     ui.table(
                         columns=[
@@ -655,24 +698,17 @@ def render_dashboard(account_region: str, start_dt: datetime, end_dt: datetime, 
                         refs["charts"]["caller_pie"] = pie_refs
                 with ui.tab_panel("chart").classes("p-2"):
                     caller_names = [c["caller"][:25] for c in callers[:15]]
-                    refs["charts"]["caller_bar"] = ui.echart({
-                        "tooltip": {"trigger": "axis"},
-                        "legend": {"top": 0},
-                        "grid": {"top": 40, "bottom": 70, "left": 60, "right": 60},
-                        "xAxis": {"type": "category", "data": caller_names, "axisLabel": {"rotate": 40, "interval": 0}},
-                        "yAxis": [
-                            {"type": "value", "name": "Tokens"},
-                            {"type": "value", "name": "Cost ($)"},
-                        ],
-                        "series": [
-                            {"name": "Input Tokens", "type": "bar", "data": [c["input_tokens"] for c in callers[:15]]},
-                            {"name": "Output Tokens", "type": "bar", "data": [c["output_tokens"] for c in callers[:15]]},
-                            {"name": "Cache Read $", "type": "bar", "stack": "cost", "yAxisIndex": 1, "itemStyle": {"color": "#06B6D4"}, "data": [round(c["cost_cache_read"], 4) for c in callers[:15]]},
-                            {"name": "Cache Write $", "type": "bar", "stack": "cost", "yAxisIndex": 1, "itemStyle": {"color": "#8B5CF6"}, "data": [round(c["cost_cache_write"], 4) for c in callers[:15]]},
-                            {"name": "Input $", "type": "bar", "stack": "cost", "yAxisIndex": 1, "itemStyle": {"color": "#3B82F6"}, "data": [round(c["cost_input"], 4) for c in callers[:15]]},
-                            {"name": "Output $", "type": "bar", "stack": "cost", "yAxisIndex": 1, "itemStyle": {"color": "#F97316"}, "data": [round(c["cost_output"], 4) for c in callers[:15]]},
-                        ],
-                    }).classes("w-full h-96")
+                    refs["charts"]["caller_bar"] = ui.echart(_usage_cost_bar_option(
+                        caller_names,
+                        [c["input_tokens"] for c in callers[:15]],
+                        [c["output_tokens"] for c in callers[:15]],
+                        [c["cache_read_tokens"] for c in callers[:15]],
+                        [c["cache_write_tokens"] for c in callers[:15]],
+                        [round(c["cost_input"], 4) for c in callers[:15]],
+                        [round(c["cost_output"], 4) for c in callers[:15]],
+                        [round(c["cost_cache_read"], 4) for c in callers[:15]],
+                        [round(c["cost_cache_write"], 4) for c in callers[:15]],
+                    )).classes("w-full h-96")
                 with ui.tab_panel("table"):
                     ui.table(
                         columns=[
