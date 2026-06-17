@@ -179,20 +179,27 @@ def build_event(record, path_account_id, path_region, source_s3_key):
         usage = body.get("usage") or {}
         metrics = body.get("metrics") or {}
     elif isinstance(body, list):
-        # Streaming — walk chunks until we find usage
+        # Streaming (InvokeModelWithResponseStream): final token counts are only complete at the end of the stream, 
+        # so we must NOT stop at message_start (its output_tokens is an initial snapshot, e.g. 8). 
+        # Collect both and merge with final totals winning:
+        #   - message_start.usage carries the cache_creation 5m/1h split (fixed at request start)
+        #   - message_delta.usage carries the final output_tokens; it usually omits cache_creation
+        # so message_start's split is preserved underneath.
+        start_usage, final_usage = {}, {}
         for chunk in body:
             if not isinstance(chunk, dict):
                 continue
-            # Anthropic message_start shape (InvokeModelWithResponseStream)
-            if chunk.get("type") == "message_start":
-                msg = chunk.get("message") or {}
-                usage = msg.get("usage") or {}
-                break
-            # Bedrock Converse metadata shape (future-proof)
-            meta = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else None
-            if meta and "usage" in meta:
-                usage = meta["usage"] or {}
-                break
+            ctype = chunk.get("type")
+            if ctype == "message_start":
+                start_usage = (chunk.get("message") or {}).get("usage") or {}
+            elif ctype == "message_delta":
+                final_usage = chunk.get("usage") or {}
+            else:
+                # Bedrock Converse metadata shape (future-proof)
+                meta = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else None
+                if meta and "usage" in meta:
+                    final_usage = meta["usage"] or {}
+        usage = {**start_usage, **final_usage}
 
     latency_ms = _as_int(metrics.get("latencyMs")) or None
 
