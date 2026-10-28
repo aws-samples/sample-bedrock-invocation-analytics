@@ -6,7 +6,6 @@ import aggregate_stats as agg
 import bedrock_logging as bl
 import lf_admin
 import sync_pricing as sp
-from webui.auth import LoginThrottle, credentials_match, safe_redirect
 
 NOW = datetime(2026, 10, 28, 12, tzinfo=timezone.utc)
 
@@ -165,26 +164,3 @@ def test_lf_admin_leaves_preexisting_admin_on_delete():
     pid = lf_admin.handle(lf_event("Create"), client)
     lf_admin.handle(lf_event("Delete", pid), client)
     assert client.admins() == ["arn:me"]
-
-
-# ── WebUI auth helpers ──
-
-@pytest.mark.parametrize("target, expected", [
-    ("/pricing", "/pricing"), ("//evil.com", "/"), ("https://evil.com", "/"), ("/\\evil.com", "/"), ("", "/"),
-])
-def test_safe_redirect(target, expected):
-    assert safe_redirect(target) == expected
-
-
-def test_credentials_match():
-    assert credentials_match("u", "p", "u", "p")
-    assert not credentials_match("u", "x", "u", "p")
-    assert not credentials_match(None, None, "u", "p")
-
-
-def test_login_throttle_locks_then_expires():
-    t = LoginThrottle(max_failures=2, window_s=60)
-    t.record_failure("ip", now=0)
-    t.record_failure("ip", now=1)
-    assert t.is_locked("ip", now=2)
-    assert not t.is_locked("ip", now=100)

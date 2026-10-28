@@ -1,28 +1,36 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
-"""DynamoDB data access for WebUI."""
+"""DynamoDB / CloudWatch data access for the WebUI API."""
 
+import json
 import os
 from datetime import datetime, timedelta, timezone, tzinfo
-from pathlib import Path
 
 import boto3
-import yaml
 from boto3.dynamodb.conditions import Key
 
 USAGE_TABLE = os.environ.get("USAGE_STATS_TABLE", "BedrockInvocationAnalytics-usage-stats")
 PRICING_TABLE = os.environ.get("MODEL_PRICING_TABLE", "BedrockInvocationAnalytics-model-pricing")
-AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-west-2")
 
-# V3 data layer (Iceberg via Athena federated catalog)
-ATHENA_WORKGROUP = os.environ.get("ATHENA_WORKGROUP", "")
-ICEBERG_CATALOG = os.environ.get("ICEBERG_CATALOG", "")
-ICEBERG_DATABASE = os.environ.get("ICEBERG_DATABASE", "bedrock_analytics")
-ICEBERG_TABLE = os.environ.get("ICEBERG_TABLE", "usage_events")
+_clients: dict = {}
 
-_ddb = boto3.resource("dynamodb", region_name=AWS_REGION)
-_usage = _ddb.Table(USAGE_TABLE)
-_pricing = _ddb.Table(PRICING_TABLE)
+
+def _usage():
+    if "usage" not in _clients:
+        _clients["usage"] = boto3.resource("dynamodb").Table(USAGE_TABLE)
+    return _clients["usage"]
+
+
+def _pricing():
+    if "pricing" not in _clients:
+        _clients["pricing"] = boto3.resource("dynamodb").Table(PRICING_TABLE)
+    return _clients["pricing"]
+
+
+def _cw():
+    if "cw" not in _clients:
+        _clients["cw"] = boto3.client("cloudwatch")
+    return _clients["cw"]
 
 
 def _plan_segments(start_dt: datetime, end_dt: datetime) -> list[tuple[str, str, str]]:
@@ -116,7 +124,7 @@ def _next_month_start(dt: datetime) -> datetime:
 def get_l2_checkpoint() -> dict | None:
     """Read META/L2#latest. Returns None if L2 hasn't run yet (e.g. fresh deploy)."""
     try:
-        resp = _usage.get_item(Key={"PK": "META", "SK": "L2#latest"})
+        resp = _usage().get_item(Key={"PK": "META", "SK": "L2#latest"})
     except Exception as e:
         print(f"[WARN] Failed to read L2 checkpoint: {e}")
         return None
@@ -127,60 +135,25 @@ def unpriced_models(days: int = 7) -> list[str]:
     """Models L2 counted at $0 within the last `days` (META/UNPRICED#<model>, cleared by a cost rebuild)."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     try:
-        items = _usage.query(KeyConditionExpression=Key("PK").eq("META") & Key("SK").begins_with("UNPRICED#"))["Items"]
+        items = _usage().query(KeyConditionExpression=Key("PK").eq("META") & Key("SK").begins_with("UNPRICED#"))["Items"]
     except Exception as e:  # noqa: BLE001 — a warning banner must not break the dashboard
         print(f"[WARN] Failed to read unpriced markers: {e}")
         return []
     return sorted(i["SK"].removeprefix("UNPRICED#") for i in items if i.get("last_seen", "") >= cutoff)
 
 
-def _load_config_names() -> dict[str, str]:
-    """Map profile → friendly name from config.yaml. Best-effort; returns {} on any failure.
-    Also keyed by account_id once resolved (we can't resolve profile → account_id here, so
-    dashboard falls back to profile name if account_id lookup fails)."""
-    cfg_path = Path(__file__).resolve().parent.parent / "config.yaml"
-    if not cfg_path.exists():
-        return {}
+def _account_names() -> dict[str, str]:
+    """account_id → friendly name, from ACCOUNT_NAMES (JSON object set by the stack from config.yaml)."""
     try:
-        with open(cfg_path, encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-    except Exception as e:
-        print(f"[WARN] Failed to read config.yaml: {e}")
+        return json.loads(os.environ.get("ACCOUNT_NAMES") or "{}")
+    except ValueError:
         return {}
-    # Map profile → name. account_id isn't in config.yaml, so dashboard will match
-    # by calling aws sts get-caller-identity at startup (cheap), but for simplicity
-    # we just key by profile and let the caller resolve.
-    return {a["profile"]: a.get("name") or a["profile"]
-            for a in (cfg.get("accounts") or []) if a.get("profile")}
-
-
-def _account_id_to_name() -> dict[str, str]:
-    """Map account_id → friendly name by resolving each config profile via STS.
-    Silent on failures (returns empty map for unresolvable profiles)."""
-    profile_names = _load_config_names()
-    result = {}
-    for profile, name in profile_names.items():
-        try:
-            sess = boto3.Session(profile_name=profile)
-            acct = sess.client("sts").get_caller_identity()["Account"]
-            result[acct] = name
-        except Exception as e:
-            print(f"[WARN] Can't resolve account_id for profile={profile}: {e}")
-    return result
-
-
-_ACCOUNT_NAMES = _account_id_to_name()
 
 
 def get_accounts() -> list[dict]:
-    """Get registered account#region list, annotated with config.yaml friendly name."""
-    try:
-        resp = _usage.query(
-            KeyConditionExpression=Key("PK").eq("META") & Key("SK").begins_with("ACCOUNT#"),
-        )
-    except Exception as e:
-        print(f"[ERROR] Failed to query DynamoDB table '{USAGE_TABLE}' in {AWS_REGION}: {e}")
-        return []
+    """Registered account#region list, annotated with friendly names."""
+    resp = _usage().query(KeyConditionExpression=Key("PK").eq("META") & Key("SK").begins_with("ACCOUNT#"))
+    names = _account_names()
     results = []
     for item in resp.get("Items", []):
         acct_region = item["SK"].replace("ACCOUNT#", "")
@@ -190,7 +163,7 @@ def get_accounts() -> list[dict]:
             "account_id": acct_id,
             "region": parts[1] if len(parts) > 1 else "",
             "key": acct_region,
-            "name": _ACCOUNT_NAMES.get(acct_id, ""),
+            "name": names.get(acct_id, ""),
         })
     return results
 
@@ -211,7 +184,7 @@ def query_usage(account_region: str, segments: list[tuple[str, str, str]], dimen
         items: list[dict] = []
         kwargs = {"KeyConditionExpression": Key("PK").eq(account_region) & Key("SK").between(sk_start, sk_end)}
         while True:
-            resp = _usage.query(**kwargs)
+            resp = _usage().query(**kwargs)
             items.extend(resp.get("Items", []))
             if "LastEvaluatedKey" not in resp:
                 break
@@ -407,15 +380,15 @@ PRICE_FIELDS = ("input_per_1k", "output_per_1k", "cache_read_per_1k", "cache_wri
 
 def _pricing_record(model_id: str, item: dict) -> dict:
     return {"model_id": model_id, "effective_date": item["SK"], "source": item.get("source", ""),
-            **{f: float(item.get(f, 0) or 0) for f in PRICE_FIELDS}}
+            "updated_by": item.get("updated_by", ""), **{f: float(item.get(f, 0) or 0) for f in PRICE_FIELDS}}
 
 
 def get_all_pricing() -> list[dict]:
     """Current effective price per model (latest SK). Full scan; the table holds ~1K items."""
-    resp = _pricing.scan()
+    resp = _pricing().scan()
     items = resp.get("Items", [])
     while resp.get("LastEvaluatedKey"):
-        resp = _pricing.scan(ExclusiveStartKey=resp["LastEvaluatedKey"])
+        resp = _pricing().scan(ExclusiveStartKey=resp["LastEvaluatedKey"])
         items.extend(resp.get("Items", []))
     latest: dict[str, dict] = {}
     for item in items:
@@ -428,13 +401,10 @@ def get_all_pricing() -> list[dict]:
 def get_pricing_sync_info() -> dict | None:
     """Get last pricing sync metadata."""
     try:
-        resp = _usage.get_item(Key={"PK": "META", "SK": "PRICING_SYNC#latest"})
+        resp = _usage().get_item(Key={"PK": "META", "SK": "PRICING_SYNC#latest"})
         return resp.get("Item")
     except Exception:
         return None
-
-
-_cw = boto3.client("cloudwatch", region_name=AWS_REGION)
 
 
 def get_ttft_trend(model_id: str, start_dt: datetime, end_dt: datetime) -> list[dict]:
@@ -442,7 +412,7 @@ def get_ttft_trend(model_id: str, start_dt: datetime, end_dt: datetime) -> list[
     span_days = (end_dt - start_dt).total_seconds() / 86400
     period = 3600 if span_days <= 7 else 86400
     try:
-        resp = _cw.get_metric_data(
+        resp = _cw().get_metric_data(
             MetricDataQueries=[
                 {"Id": "avg", "MetricStat": {"Metric": {"Namespace": "AWS/Bedrock", "MetricName": "TimeToFirstToken", "Dimensions": [{"Name": "ModelId", "Value": model_id}]}, "Period": period, "Stat": "Average"}},
                 {"Id": "p99", "MetricStat": {"Metric": {"Namespace": "AWS/Bedrock", "MetricName": "TimeToFirstToken", "Dimensions": [{"Name": "ModelId", "Value": model_id}]}, "Period": period, "Stat": "p99"}},
@@ -456,30 +426,31 @@ def get_ttft_trend(model_id: str, start_dt: datetime, end_dt: datetime) -> list[
 
     results = {r["Id"]: dict(zip(r["Timestamps"], r["Values"])) for r in resp.get("MetricDataResults", [])}
     timestamps = sorted(set(results.get("avg", {}).keys()) | set(results.get("p99", {}).keys()))
-    return [{"period": t.strftime("%Y-%m-%dT%H" if period == 3600 else "%Y-%m-%d"),
+    return [{"timestamp": t.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
              "ttft_avg": round(results.get("avg", {}).get(t, 0)),
              "ttft_p99": round(results.get("p99", {}).get(t, 0))} for t in timestamps]
 
 
-def save_pricing(model_id: str, prices: dict[str, float], effective_date: str):
+def save_pricing(model_id: str, prices: dict[str, float], effective_date: str, updated_by: str):
     """Save a manual pricing record with every price field, so cache and per-request prices aren't dropped."""
-    _pricing.put_item(Item={
+    _pricing().put_item(Item={
         "PK": f"MODEL#{model_id}",
         "SK": effective_date,
         **{f: format(round(float(prices.get(f) or 0), 9), "f").rstrip("0").rstrip(".") or "0" for f in PRICE_FIELDS},
         "source": "manual",
+        "updated_by": updated_by,
     })
 
 
 def get_pricing_history(model_id: str) -> list[dict]:
     """All pricing records for a model, newest first."""
-    resp = _pricing.query(KeyConditionExpression=Key("PK").eq(f"MODEL#{model_id}"), ScanIndexForward=False)
+    resp = _pricing().query(KeyConditionExpression=Key("PK").eq(f"MODEL#{model_id}"), ScanIndexForward=False)
     return [_pricing_record(model_id, item) for item in resp.get("Items", [])]
 
 
 def delete_pricing(model_id: str, effective_date: str):
     """Delete a pricing record."""
-    _pricing.delete_item(Key={"PK": f"MODEL#{model_id}", "SK": effective_date})
+    _pricing().delete_item(Key={"PK": f"MODEL#{model_id}", "SK": effective_date})
 
 
 def _format_item(item: dict) -> dict:

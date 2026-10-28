@@ -1,0 +1,205 @@
+import base64
+import gzip
+import json
+import time
+
+import jwt
+import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+import app as webui
+import auth
+import store
+
+REGION, POOL, CLIENT = "us-west-2", "us-west-2_TEST", "client123"
+ISSUER = f"https://cognito-idp.{REGION}.amazonaws.com/{POOL}"
+KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+OTHER_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+class FakeJwks:
+    def get_signing_key_from_jwt(self, token):
+        return type("K", (), {"key": KEY.public_key()})()
+
+
+def token(key=KEY, **overrides):
+    claims = {"iss": ISSUER, "exp": int(time.time()) + 600, "token_use": "access", "client_id": CLIENT,
+              "username": "alice", "cognito:groups": ["bedrock-analytics-viewer"], **overrides}
+    return jwt.encode({k: v for k, v in claims.items() if v is not None}, key, algorithm="RS256")
+
+
+VERIFIER = auth.TokenVerifier(REGION, POOL, CLIENT, jwks_client=FakeJwks())
+
+
+# ── auth ──
+
+def test_valid_viewer_token():
+    user = VERIFIER.verify(f"Bearer {token()}")
+    assert user.username == "alice" and user.is_viewer and not user.is_admin
+
+
+@pytest.mark.parametrize("bad", [
+    {"key": OTHER_KEY},                       # wrong signature
+    {"exp": int(time.time()) - 120},          # expired beyond leeway
+    {"token_use": "id"},                      # ID token instead of access token
+    {"client_id": "another-app"},             # token for another client
+    {"iss": "https://cognito-idp.us-west-2.amazonaws.com/other"},
+    {"client_id": None},                      # missing required claim
+])
+def test_rejected_tokens(bad):
+    key = bad.pop("key", KEY)
+    with pytest.raises(auth.AuthError) as e:
+        VERIFIER.verify(f"Bearer {token(key=key, **bad)}")
+    assert e.value.status == 401
+
+
+@pytest.mark.parametrize("header", [None, "", "Basic abc", "Bearer"])
+def test_missing_bearer(header):
+    with pytest.raises(auth.AuthError):
+        VERIFIER.verify(header)
+
+
+def test_group_requirements():
+    viewer = auth.User("v", frozenset({auth.VIEWER_GROUP}))
+    admin = auth.User("a", frozenset({auth.ADMIN_GROUP}))
+    nobody = auth.User("n", frozenset())
+    assert auth.require(admin, admin=True) is admin and auth.require(admin) is admin
+    with pytest.raises(auth.AuthError) as e:
+        auth.require(viewer, admin=True)
+    assert e.value.status == 403
+    with pytest.raises(auth.AuthError):
+        auth.require(nobody)
+
+
+# ── routing ──
+
+@pytest.fixture
+def api(monkeypatch, tmp_path):
+    monkeypatch.setattr(webui, "_verifier", VERIFIER)
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "index.html").write_text("<html>" + "x" * 2000 + "</html>")
+    (tmp_path / "assets" / "app-abc123.js").write_text("console.log(1);" * 200)
+    monkeypatch.setattr(webui, "STATIC_DIR", tmp_path.resolve())
+    webui._load.cache_clear()
+    return monkeypatch
+
+
+def call(path, method="GET", query=None, groups=("bedrock-analytics-viewer",), body=None, auth_header=True, headers=None):
+    hdrs = {"host": "alb.internal", **(headers or {})}
+    if auth_header:
+        hdrs["authorization"] = f"Bearer {token(**{'cognito:groups': list(groups)})}"
+    event = {"requestContext": {"elb": {"targetGroupArn": "arn:tg"}}, "httpMethod": method, "path": path,
+             "queryStringParameters": query or {}, "headers": hdrs,
+             "body": json.dumps(body) if body is not None else "", "isBase64Encoded": False}
+    resp = webui.handler(event, None)
+    raw = resp.get("body") or ""
+    data = base64.b64decode(raw) if resp.get("isBase64Encoded") else raw.encode()
+    return resp["statusCode"], resp.get("headers", {}), data
+
+
+RANGE = {"start": "2026-10-21T00:00:00+08:00", "end": "2026-10-28T00:00:00+08:00"}
+
+
+def test_dashboard_passes_validated_inputs(api):
+    seen = {}
+    api.setattr(store, "get_dashboard_bundle", lambda acct, s, e, tz: seen.update(acct=acct, tz=str(tz)) or {"summary": {"cost_usd": 1.5}})
+    status, headers, body = call("/api/dashboard", query={**RANGE, "account": "111122223333#us-west-2", "tz": "Asia/Singapore"})
+    assert status == 200 and json.loads(body)["summary"]["cost_usd"] == 1.5
+    assert seen == {"acct": "111122223333#us-west-2", "tz": "Asia/Singapore"}
+    assert headers["Cache-Control"] == "no-store"
+
+
+@pytest.mark.parametrize("query, message", [
+    ({**RANGE, "account": "bad"}, "account"),
+    ({"start": RANGE["start"], "account": "111122223333#us-west-2"}, "end"),
+    ({"start": "2026-10-28T00:00:00", "end": RANGE["end"], "account": "111122223333#us-west-2"}, "UTC offset"),
+    ({"start": RANGE["end"], "end": RANGE["start"], "account": "111122223333#us-west-2"}, "after start"),
+    ({"start": "2020-01-01T00:00:00Z", "end": "2026-01-01T00:00:00Z", "account": "111122223333#us-west-2"}, "exceed"),
+    ({**RANGE, "account": "111122223333#us-west-2", "tz": "Mars/Base"}, "IANA"),
+])
+def test_dashboard_rejects_bad_input(api, query, message):
+    status, _, body = call("/api/dashboard", query=query)
+    assert status == 400 and message in json.loads(body)["error"]
+
+
+def test_trend_dimension_validation(api):
+    api.setattr(store, "get_trend", lambda *a: [])
+    ok = call("/api/trend", query={**RANGE, "account": "111122223333#us-west-2", "dim": "MODEL#global.anthropic.claude-opus-5-5"})
+    bad = call("/api/trend", query={**RANGE, "account": "111122223333#us-west-2", "dim": "DEDUP#x"})
+    assert ok[0] == 200 and bad[0] == 400
+
+
+def test_unauthenticated_and_unauthorized(api):
+    assert call("/api/accounts", auth_header=False)[0] == 401
+    assert call("/api/accounts", groups=())[0] == 403
+
+
+def test_pricing_write_requires_admin(api):
+    saved = {}
+    api.setattr(store, "save_pricing", lambda m, p, d, updated_by: saved.update(m=m, p=p, d=d, by=updated_by))
+    body = {"effective_date": "2026-11-01T08:00:00+08:00", "input_per_1k": 0.003, "output_per_1k": 0.015}
+    assert call("/api/pricing/cohere.rerank-v3-5:0", method="PUT", body=body)[0] == 403
+    status, _, _ = call("/api/pricing/cohere.rerank-v3-5:0", method="PUT", body=body, groups=["bedrock-analytics-admin"])
+    assert status == 204
+    assert saved["m"] == "cohere.rerank-v3-5:0" and saved["d"] == "2026-11-01T00:00:00Z" and saved["by"] == "alice"
+    assert saved["p"]["per_request"] == 0.0
+
+
+@pytest.mark.parametrize("bad", [{"input_per_1k": -1}, {"input_per_1k": "1"}, {"input_per_1k": True}, {"per_request": 5000}])
+def test_pricing_write_validates_prices(api, bad):
+    api.setattr(store, "save_pricing", lambda *a, **k: pytest.fail("must not save"))
+    body = {"effective_date": "2026-11-01T00:00:00Z", **bad}
+    assert call("/api/pricing/m", method="PUT", body=body, groups=["bedrock-analytics-admin"])[0] == 400
+
+
+def test_unknown_api_route_is_json_404(api):
+    status, headers, body = call("/api/nope")
+    assert status == 404 and json.loads(body)["error"] == "Not found"
+
+
+# ── static ──
+
+def test_config_json_is_public(api):
+    status, _, body = call("/config.json", auth_header=False)
+    assert status == 200 and set(json.loads(body)) == {"region", "userPoolId", "userPoolClientId"}
+
+
+def test_spa_fallback_serves_index_with_csp(api):
+    status, headers, body = call("/pricing", auth_header=False, headers={"accept-encoding": "gzip, br"})
+    assert status == 200 and headers["Content-Encoding"] == "gzip"
+    assert gzip.decompress(body).startswith(b"<html>")
+    assert "default-src 'self'" in headers["Content-Security-Policy"] and headers["Cache-Control"] == "no-cache"
+
+
+def test_hashed_asset_is_immutable_and_uncompressed_without_accept_encoding(api):
+    status, headers, body = call("/assets/app-abc123.js", auth_header=False)
+    assert status == 200 and body.startswith(b"console.log")
+    assert "immutable" in headers["Cache-Control"] and "Content-Encoding" not in headers
+
+
+def test_path_traversal_falls_back_to_index(api):
+    status, _, body = call("/../../etc/passwd", auth_header=False)
+    assert status == 200 and body.startswith(b"<html>")
+
+
+# ── store: segment planning and rebucketing ──
+
+def test_plan_segments_uses_coarsest_complete_tiers():
+    from datetime import datetime, timezone
+    segs = store._plan_segments(datetime(2026, 8, 15, 5, tzinfo=timezone.utc), datetime(2026, 10, 3, tzinfo=timezone.utc))
+    assert segs == [("HOURLY", "2026-08-15T05", "2026-08-15T23"), ("DAILY", "2026-08-16", "2026-08-31"),
+                    ("MONTHLY", "2026-09", "2026-09"), ("DAILY", "2026-10-01", "2026-10-02")]
+
+
+def test_rebucket_groups_hours_into_local_days():
+    from zoneinfo import ZoneInfo
+    rows = [{"period": "2026-10-27T15", "granularity": "HOURLY", "invocations": 1, "cost_micro_usd": 1_000_000},
+            {"period": "2026-10-27T17", "granularity": "HOURLY", "invocations": 2, "cost_micro_usd": 500_000}]
+    out = store._rebucket(rows, "DAILY", ZoneInfo("Asia/Singapore"))  # 15:00Z = 23:00 local, 17:00Z = next day
+    assert [(r["period"], r["invocations"], r["cost_usd"]) for r in out] == [("2026-10-27", 1, 1.0), ("2026-10-28", 2, 0.5)]
+
+
+def test_oversized_asset_is_gzipped_even_without_accept_encoding(api, tmp_path):
+    (tmp_path / "assets" / "big-abc.css").write_text(".a{color:red}" * 60_000)  # ~780 KB raw
+    status, headers, body = call("/assets/big-abc.css", auth_header=False)
+    assert status == 200 and headers["Content-Encoding"] == "gzip" and len(body) < 100_000
