@@ -70,7 +70,9 @@ export interface Status {
   data_up_to: string | null
   unpriced_models: string[]
   pricing_sync: { synced_at?: string; models_updated?: number; models_added?: number; models_skipped?: number } | null
-  user: { username: string; is_admin: boolean }
+  user: { username: string; email: string; is_admin: boolean }
+  admin_group: string
+  data_sources: { region?: string; usage_table?: string; pricing_table?: string; athena_workgroup?: string; iceberg_table?: string }
 }
 
 export const PRICE_FIELDS = ['input_per_1k', 'output_per_1k', 'cache_read_per_1k', 'cache_write_per_1k', 'cache_write_1h_per_1k', 'per_request'] as const
@@ -113,7 +115,9 @@ export interface RangeParams {
   tz: string
 }
 
-const qs = (params: Record<string, string>) => new URLSearchParams(params).toString()
+// encodeURIComponent, not URLSearchParams: spaces must be %20 because the API decodes with plain percent-decoding.
+const qs = (params: Record<string, string>) =>
+  Object.entries(params).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&')
 
 export const api = {
   accounts: () => request<{ accounts: Account[] }>('/api/accounts').then((r) => r.accounts),

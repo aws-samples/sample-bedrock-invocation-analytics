@@ -11,15 +11,20 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import unquote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aws_lambda_powertools.event_handler import ALBResolver, Response
 
+import boto3
+
 import store
-from auth import AuthError, TokenVerifier, User, require
+from auth import ADMIN_GROUP, AuthError, TokenVerifier, User, require
 
 REGION = os.environ.get("AWS_REGION", "us-west-2")
 USER_POOL_ID = os.environ.get("USER_POOL_ID", "")
+# The pool may live in another region than this Lambda; its ID carries the region ("ap-southeast-1_AbCd123").
+POOL_REGION = USER_POOL_ID.split("_", 1)[0] if "_" in USER_POOL_ID else REGION
 USER_POOL_CLIENT_ID = os.environ.get("USER_POOL_CLIENT_ID", "")
 STATIC_DIR = Path(os.environ.get("STATIC_DIR") or Path(__file__).parent / "static").resolve()
 MAX_RANGE = timedelta(days=400)
@@ -46,7 +51,9 @@ def _json_default(value):
     raise TypeError(f"Not JSON serializable: {type(value).__name__}")
 
 
-app = ALBResolver(serializer=lambda obj: json.dumps(obj, default=_json_default, separators=(",", ":")))
+# ALB passes query strings to Lambda still URL-encoded; the resolver decodes them.
+app = ALBResolver(serializer=lambda obj: json.dumps(obj, default=_json_default, separators=(",", ":")),
+                  decode_query_parameters=True)
 _verifier: TokenVerifier | None = None
 
 
@@ -56,7 +63,7 @@ class BadRequest(Exception):
 
 def verifier() -> TokenVerifier:
     global _verifier
-    _verifier = _verifier or TokenVerifier(REGION, USER_POOL_ID, USER_POOL_CLIENT_ID)
+    _verifier = _verifier or TokenVerifier(POOL_REGION, USER_POOL_ID, USER_POOL_CLIENT_ID)
     return _verifier
 
 
@@ -64,10 +71,22 @@ def current_user(admin: bool = False) -> User:
     return require(verifier().verify(app.current_event.headers.get("authorization")), admin=admin)
 
 
+@lru_cache(maxsize=512)
+def user_email(username: str) -> str:
+    """Email for a pool username (with email sign-in the username is an opaque ID); falls back to the username."""
+    try:
+        attrs = boto3.client("cognito-idp", region_name=POOL_REGION).admin_get_user(UserPoolId=USER_POOL_ID, Username=username)["UserAttributes"]
+    except Exception as e:  # noqa: BLE001 — a display/audit label must not fail the request
+        print(f"[WARN] admin_get_user failed for {username}: {e}")
+        return username
+    return next((a["Value"] for a in attrs if a["Name"] == "email"), username)
+
+
 # ── Input parsing ──
 
 def query_param(name: str, required: bool = True, default: str = "") -> str:
-    value = (app.current_event.query_string_parameters or {}).get(name)
+    values = app.current_event.resolved_query_string_parameters.get(name)
+    value = values[-1] if values else None
     if value is None:
         if required:
             raise BadRequest(f"Missing query parameter: {name}")
@@ -108,6 +127,7 @@ def parse_tz(value: str) -> ZoneInfo:
 
 
 def parse_model(value: str) -> str:
+    value = unquote(value)  # path segments arrive percent-encoded (e.g. ':' as %3A)
     if not MODEL_RE.match(value):
         raise BadRequest("Invalid model id")
     return value
@@ -167,7 +187,9 @@ def status():
         "data_up_to": checkpoint.get("last_window_end"),
         "unpriced_models": store.unpriced_models(),
         "pricing_sync": store.get_pricing_sync_info(),
-        "user": {"username": user.username, "is_admin": user.is_admin},
+        "user": {"username": user.username, "email": user_email(user.username), "is_admin": user.is_admin},
+        "admin_group": ADMIN_GROUP,
+        "data_sources": json.loads(os.environ.get("DATA_SOURCES") or "{}"),
     }
 
 
@@ -194,7 +216,7 @@ def pricing_save(model: str):
         raise BadRequest("Body must be a JSON object")
     effective_date = parse_time("effective_date", str(body.get("effective_date", "")))
     effective = effective_date.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
-    store.save_pricing(parse_model(model), parse_prices(body), effective, updated_by=user.username)
+    store.save_pricing(parse_model(model), parse_prices(body), effective, updated_by=user_email(user.username))
     return Response(status_code=204, body="")
 
 
@@ -211,7 +233,7 @@ def pricing_delete(model: str):
 @app.get("/config.json")
 def runtime_config():
     return Response(status_code=200, content_type="application/json", headers={"Cache-Control": "no-store"},
-                    body=json.dumps({"region": REGION, "userPoolId": USER_POOL_ID, "userPoolClientId": USER_POOL_CLIENT_ID}))
+                    body=json.dumps({"region": POOL_REGION, "userPoolId": USER_POOL_ID, "userPoolClientId": USER_POOL_CLIENT_ID}))
 
 
 @app.not_found
@@ -246,7 +268,7 @@ def static_response(file: Path, accepts_gzip: bool) -> Response:
     if file.name == "index.html":
         headers["Content-Security-Policy"] = (
             "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-            f"font-src 'self' data:; connect-src 'self' https://cognito-idp.{REGION}.amazonaws.com; "
+            f"font-src 'self' data:; connect-src 'self' https://cognito-idp.{POOL_REGION}.amazonaws.com; "
             "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         )
     return Response(status_code=200, content_type=content_type, body=body, headers=headers, compress=False)

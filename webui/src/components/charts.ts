@@ -7,7 +7,9 @@ const COLOR = { input: '#5070dd', cache_read: '#b6d634', cache_write: '#f97317',
 const COST_DECAL = { symbol: 'line', dashArrayX: [1, 0], dashArrayY: [4, 3], rotation: -0.785, color: 'rgba(255,255,255,0.4)' }
 const MIN_MAX = { min: '#10B981', avg: '#E879F9', max: '#8B5CF6' }
 
-const axisLabels = (labels: string[]) => ({ type: 'category', data: labels, axisLabel: { rotate: 40, interval: 0 } })
+// Long names (callers are ARN paths) are truncated on the axis; the tooltip shows the full name.
+const axisLabels = (labels: string[]) =>
+  ({ type: 'category', data: labels, axisLabel: { rotate: 40, interval: 0, width: 160, overflow: 'truncate' } })
 
 /** Three bars per row: input-side tokens (stacked with cache), output tokens, and a stacked cost bar on the right axis. */
 export function usageCostBar(labels: string[], rows: UsageRow[]): ChartOption {

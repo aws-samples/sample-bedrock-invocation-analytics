@@ -4,10 +4,14 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { getCurrentUser, signOut } from 'aws-amplify/auth'
 import AppLayout from '@cloudscape-design/components/app-layout'
 import Box from '@cloudscape-design/components/box'
-import SideNavigation from '@cloudscape-design/components/side-navigation'
+import HelpPanel from '@cloudscape-design/components/help-panel'
+import KeyValuePairs from '@cloudscape-design/components/key-value-pairs'
+import BreadcrumbGroup from '@cloudscape-design/components/breadcrumb-group'
 import Spinner from '@cloudscape-design/components/spinner'
 import TopNavigation from '@cloudscape-design/components/top-navigation'
-import { api, ApiError } from './api'
+import { api, type Status } from './api'
+import { FiltersProvider } from './filters'
+import { useFilters } from './filters-context'
 import Login from './pages/Login'
 
 const APP_VERSION = import.meta.env.VITE_APP_VERSION ?? ''
@@ -22,14 +26,21 @@ export default function App() {
 
   if (signedIn === null) return <Box textAlign="center" padding="xxxl"><Spinner size="large" /></Box>
   if (!signedIn) return <Login onSignedIn={() => setSignedIn(true)} />
-  return <Shell onSignOut={async () => { await signOut(); queryClient.clear(); setSignedIn(false) }} />
+  return (
+    <FiltersProvider>
+      <Shell onSignOut={async () => { await signOut(); queryClient.clear(); setSignedIn(false) }} />
+    </FiltersProvider>
+  )
 }
 
 function Shell({ onSignOut }: { onSignOut: () => void }) {
   const navigate = useNavigate()
   const { pathname } = useLocation()
   const status = useQuery({ queryKey: ['status'], queryFn: api.status, refetchInterval: 60_000 })
-  const denied = status.error instanceof ApiError && status.error.status === 403
+  const [toolsOpen, setToolsOpen] = useState(false)
+  const [filtersOpen, setFiltersOpen] = useState(() => localStorage.getItem('filtersOpen') !== 'false')
+  const { panel } = useFilters()
+  const onDashboard = pathname === '/'
 
   return (
     <>
@@ -37,10 +48,18 @@ function Shell({ onSignOut }: { onSignOut: () => void }) {
         <TopNavigation
           identity={{ href: '/', title: 'Bedrock Invocation Analytics', onFollow: (e) => { e.preventDefault(); navigate('/') } }}
           utilities={[{
+            type: 'button',
+            iconName: 'settings',
+            ariaLabel: 'Pricing settings',
+            title: 'Pricing settings',
+            href: '/pricing',
+            onClick: (e) => { e.preventDefault(); navigate('/pricing') },
+          }, {
             type: 'menu-dropdown',
-            text: status.data?.user.username ?? '',
-            description: status.data?.user.is_admin ? 'Administrator' : 'Viewer',
             iconName: 'user-profile',
+            ariaLabel: 'User menu',
+            title: status.data?.user.email,
+            description: status.data && (status.data.user.is_admin ? 'Administrator' : 'Viewer (read-only)'),
             items: [{ id: 'signout', text: 'Sign out' }],
             onItemClick: (e) => e.detail.id === 'signout' && onSignOut(),
           }]}
@@ -48,20 +67,45 @@ function Shell({ onSignOut }: { onSignOut: () => void }) {
       </div>
       <AppLayout
         headerSelector="#top-nav"
-        toolsHide
-        navigation={
-          <SideNavigation
-            activeHref={pathname}
+        tools={<InfoPanel sources={status.data?.data_sources} />}
+        toolsOpen={toolsOpen}
+        onToolsChange={(e) => setToolsOpen(e.detail.open)}
+        ariaLabels={{
+          tools: 'Data sources', toolsToggle: 'Open data sources', toolsClose: 'Close data sources',
+          navigation: 'Filters', navigationToggle: 'Show filters', navigationClose: 'Hide filters',
+        }}
+        navigation={panel}
+        navigationHide={!onDashboard}
+        navigationOpen={filtersOpen}
+        navigationWidth={240}
+        onNavigationChange={(e) => { setFiltersOpen(e.detail.open); localStorage.setItem('filtersOpen', String(e.detail.open)) }}
+        breadcrumbs={!onDashboard && (
+          <BreadcrumbGroup
+            items={[{ text: 'Usage dashboard', href: '/' }, { text: 'Pricing', href: '/pricing' }]}
             onFollow={(e) => { e.preventDefault(); navigate(e.detail.href) }}
-            items={[{ type: 'link', text: 'Dashboard', href: '/' }, { type: 'link', text: 'Pricing', href: '/pricing' }]}
-            header={{ text: 'Navigation', href: '/' }}
           />
-        }
-        content={denied
-          ? <Box variant="p" padding="xxl">Your account is not in the bedrock-analytics-viewer or bedrock-analytics-admin group. Ask an administrator for access.</Box>
-          : <Outlet context={status.data} />}
+        )}
+        content={<Outlet context={status.data} />}
       />
-      {APP_VERSION && <Box variant="small" color="text-status-inactive" padding="s" textAlign="right">v{APP_VERSION}</Box>}
     </>
+  )
+}
+
+
+function InfoPanel({ sources }: { sources?: Status['data_sources'] }) {
+  const value = (v?: string) => (v ? <Box variant="code">{v}</Box> : '—')
+  return (
+    <HelpPanel header={<h2>Data sources</h2>} footer={APP_VERSION && <Box variant="small">Version {APP_VERSION}</Box>}>
+      <KeyValuePairs
+        columns={1}
+        items={[
+          { label: 'Region', value: value(sources?.region) },
+          { label: 'Usage table (DynamoDB)', value: value(sources?.usage_table) },
+          { label: 'Pricing table (DynamoDB)', value: value(sources?.pricing_table) },
+          { label: 'Athena workgroup', value: value(sources?.athena_workgroup) },
+          { label: 'Iceberg table', value: value(sources?.iceberg_table), info: <Box variant="small">Raw events, one row per call. Query it in Athena for ad-hoc analysis.</Box> },
+        ]}
+      />
+    </HelpPanel>
   )
 }

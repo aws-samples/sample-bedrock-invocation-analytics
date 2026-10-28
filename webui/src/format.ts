@@ -44,20 +44,51 @@ export function formatInTz(iso: string, tz: string, withDate = false) {
   }).format(new Date(iso))
 }
 
+// Rolling windows plus calendar periods. Calendar presets are keyed; their amount/unit only matter to the picker UI.
 export const RELATIVE_OPTIONS: DateRangePickerProps.RelativeOption[] = [
   { key: 'last-24h', amount: 24, unit: 'hour', type: 'relative' },
   { key: 'last-7d', amount: 7, unit: 'day', type: 'relative' },
   { key: 'last-30d', amount: 30, unit: 'day', type: 'relative' },
   { key: 'last-90d', amount: 90, unit: 'day', type: 'relative' },
+  { key: 'today', amount: 1, unit: 'day', type: 'relative' },
+  { key: 'this-week', amount: 1, unit: 'week', type: 'relative' },
+  { key: 'this-month', amount: 1, unit: 'month', type: 'relative' },
+  { key: 'this-quarter', amount: 3, unit: 'month', type: 'relative' },
+  { key: 'this-year', amount: 1, unit: 'year', type: 'relative' },
 ]
+
+const PRESET_LABELS: Record<string, string> = {
+  'last-24h': 'Last 24 hours', 'last-7d': 'Last 7 days', 'last-30d': 'Last 30 days', 'last-90d': 'Last 90 days',
+  today: 'Today', 'this-week': 'This week', 'this-month': 'This month', 'this-quarter': 'This quarter', 'this-year': 'This year',
+}
+
+export function formatRelativeRange(value: DateRangePickerProps.RelativeValue) {
+  return (value.key && PRESET_LABELS[value.key]) || `Last ${value.amount} ${value.unit}${value.amount === 1 ? '' : 's'}`
+}
 
 export const DEFAULT_RANGE: DateRangePickerProps.Value = RELATIVE_OPTIONS[1]
 
 const UNIT_MS: Record<string, number> = { second: 1e3, minute: 6e4, hour: 36e5, day: 864e5, week: 6048e5 }
 
+/** Start of the calendar period containing `now` in `tz` (weeks start Monday). */
+function calendarStart(key: string, now: Date, tz: string): Date | null {
+  const p = zonedParts(now, tz)
+  const weekday = (new Date(Date.UTC(p.year, p.month - 1, p.day)).getUTCDay() + 6) % 7  // Monday = 0
+  switch (key) {
+    case 'today': return fromZoned(p.year, p.month, p.day, 0, 0, tz)
+    case 'this-week': return fromZoned(p.year, p.month, p.day - weekday, 0, 0, tz)
+    case 'this-month': return fromZoned(p.year, p.month, 1, 0, 0, tz)
+    case 'this-quarter': return fromZoned(p.year, Math.floor((p.month - 1) / 3) * 3 + 1, 1, 0, 0, tz)
+    case 'this-year': return fromZoned(p.year, 1, 1, 0, 0, tz)
+    default: return null
+  }
+}
+
 /** Resolve a picker value to [start, end) instants. Absolute dates are whole days in `tz`, end day inclusive. */
 export function resolveRange(value: DateRangePickerProps.Value, tz: string, now = new Date()): [Date, Date] {
   if (value.type === 'relative') {
+    const start = value.key ? calendarStart(value.key, now, tz) : null
+    if (start) return [start, now]
     if (value.unit === 'month' || value.unit === 'year') {
       const p = zonedParts(now, tz)
       const months = value.unit === 'year' ? value.amount * 12 : value.amount

@@ -98,7 +98,7 @@ export default function Pricing({ status }: { status?: Status }) {
       </Header>
     }>
       <SpaceBetween size="l">
-        {!isAdmin && <Alert type="info">You have read-only access. Members of bedrock-analytics-admin can edit prices.</Alert>}
+        {!isAdmin && <Alert type="info">You have read-only access. Members of the {status?.admin_group ?? 'admin'} group can edit prices.</Alert>}
         <Table
           {...collectionProps}
           items={items}

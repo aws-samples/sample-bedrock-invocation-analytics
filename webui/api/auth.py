@@ -1,17 +1,20 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
-"""Cognito access-token verification and role mapping for the WebUI API."""
+"""Cognito access-token verification and role mapping for the WebUI API.
 
+Every signed-in user of the pool can view; members of ADMIN_GROUP can also edit pricing.
+"""
+
+import os
 from dataclasses import dataclass
 
 import jwt
 
-VIEWER_GROUP = "bedrock-analytics-viewer"
-ADMIN_GROUP = "bedrock-analytics-admin"
+ADMIN_GROUP = os.environ.get("ADMIN_GROUP") or "bedrock-analytics-admin"
 
 
 class AuthError(Exception):
-    """Token missing, invalid, or lacking the required group. `status` is 401 or 403."""
+    """Token missing, invalid, or lacking the admin group. `status` is 401 or 403."""
 
     def __init__(self, message: str, status: int = 401):
         super().__init__(message)
@@ -26,10 +29,6 @@ class User:
     @property
     def is_admin(self) -> bool:
         return ADMIN_GROUP in self.groups
-
-    @property
-    def is_viewer(self) -> bool:
-        return self.is_admin or VIEWER_GROUP in self.groups
 
 
 class TokenVerifier:
@@ -60,9 +59,7 @@ class TokenVerifier:
 
 
 def require(user: User, admin: bool = False) -> User:
-    """Raise 403 unless the user is a viewer (or an admin when admin=True)."""
+    """Raise 403 when admin is required and the user isn't in ADMIN_GROUP."""
     if admin and not user.is_admin:
         raise AuthError(f"Requires group {ADMIN_GROUP}", status=403)
-    if not user.is_viewer:
-        raise AuthError(f"Requires group {VIEWER_GROUP} or {ADMIN_GROUP}", status=403)
     return user

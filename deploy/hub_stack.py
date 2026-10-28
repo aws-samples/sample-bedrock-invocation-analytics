@@ -26,6 +26,7 @@ from aws_cdk import (
 from constructs import Construct
 
 import common
+from webui import WebUi, WebUiConfig
 
 ICEBERG_NAMESPACE = "bedrock_analytics"
 ICEBERG_TABLE = "usage_events"
@@ -59,7 +60,8 @@ class HubStack(Stack):
     DEDUP_TTL_HOURS = 24
 
     def __init__(self, scope: Construct, id: str, *, cost_agg_interval_min: int = 5,
-                 spoke_accounts: list[str] | None = None, alarm_email: str | None = None, **kwargs):
+                 spoke_accounts: list[str] | None = None, alarm_email: str | None = None,
+                 webui: WebUiConfig | None = None, **kwargs):
         super().__init__(scope, id, **kwargs)
         if cost_agg_interval_min < 2:
             raise ValueError("cost_agg_interval_min must be >= 2 (Firehose buffers for 60s)")
@@ -216,6 +218,11 @@ class HubStack(Stack):
                    missing=cw.TreatMissingData.BREACHING)
         alarms.add("UnpricedEventsAlarm", l2_metric("UnpricedEvents", "Sum", 60), 1,
                    "Invocations of models without a price; add pricing, then run scripts/rebuild_costs.sh")
+
+        if webui:
+            WebUi(self, "WebUi", config=webui, usage_table=usage_stats_table, pricing_table=model_pricing_table,
+                  data_sources={"athena_workgroup": workgroup.name,
+                                "iceberg_table": f"\"s3tablescatalog/{catalog['bucket_name']}\".{ICEBERG_NAMESPACE}.{ICEBERG_TABLE}"})
 
         CfnOutput(self, "BucketName", value=bucket_name)
         CfnOutput(self, "OpsBucketName", value=ops_bucket.bucket_name)

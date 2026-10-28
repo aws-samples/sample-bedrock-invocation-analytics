@@ -1,7 +1,7 @@
 # Bedrock Invocation Analytics — Deployment Configuration
 # Copy this file to config.yaml and edit with your account details.
 #
-# The account marked 'primary: true' deploys the full stack (DynamoDB, Pricing, Aggregate, WebUI).
+# The account marked 'primary: true' deploys the full stack (pipeline, DynamoDB, pricing, WebUI).
 # Other accounts deploy a lightweight spoke stack (S3, Bedrock logging, parse_log Lambda → primary account's Firehose).
 
 data:
@@ -12,10 +12,16 @@ data:
 alerts:
   email: ""
 
-# WebUI settings
+# WebUI: React SPA behind an internal ALB, Cognito sign-in
 webui:
-  admin_user: your-username
-  admin_pass: your-password
+  cloudfront: false          # true = also deploy CloudFront (VPC origin → internal ALB); public HTTPS on *.cloudfront.net
+  vpc_id: ""                 # empty = create a minimal VPC (2 AZs, no NAT)
+  subnet_ids: []             # private subnets for the ALB when vpc_id is set (2+ AZs)
+  allowed_cidrs: []          # intranet ranges allowed to reach the ALB directly (VPN, office network)
+  certificate_arn: ""        # optional ACM certificate; enables 443 HTTPS for direct ALB access (otherwise plaintext HTTP 80)
+  cognito_user_pool_id: ""   # empty = create a user pool; set to reuse an existing one
+  initial_admin_email: ""    # created pool only: first admin, temporary password sent by email
+  admin_group: bedrock-analytics-admin    # group whose members can edit pricing; empty = the stack creates bedrock-analytics-admin. Everyone else is read-only
 
 accounts:
   - profile: default           # AWS CLI profile name

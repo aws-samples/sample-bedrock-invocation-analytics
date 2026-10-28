@@ -67,7 +67,8 @@ export default function Login({ onSignedIn }: Props) {
   }
 
   const submit: Record<Step, () => Promise<void>> = {
-    signIn: async () => handleNext(await signIn({ username, password })),
+    // USER_PASSWORD_AUTH rather than SRP: user-migration triggers on existing pools only see password sign-ins.
+    signIn: async () => handleNext(await signIn({ username, password, options: { authFlowType: 'USER_PASSWORD_AUTH' } })),
     newPassword: async () => handleNext(await confirmSignIn({ challengeResponse: newPassword })),
     totp: async () => handleNext(await confirmSignIn({ challengeResponse: code })),
     totpSetup: async () => handleNext(await confirmSignIn({ challengeResponse: code })),
@@ -127,7 +128,7 @@ export default function Login({ onSignedIn }: Props) {
                   </FormField>
                 )}
                 {(step === 'newPassword' || step === 'resetCode') && (
-                  <FormField label="New password" constraintText="At least 12 characters with upper and lower case letters, a number and a symbol.">
+                  <FormField label="New password" constraintText="At least 8 characters with upper and lower case letters and a number.">
                     <Input type="password" value={newPassword} onChange={(e) => setNewPassword(e.detail.value)} autoComplete="new-password" />
                   </FormField>
                 )}

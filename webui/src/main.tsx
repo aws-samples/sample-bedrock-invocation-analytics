@@ -3,8 +3,11 @@ import { createRoot } from 'react-dom/client'
 import { createBrowserRouter, RouterProvider, useOutletContext } from 'react-router'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import '@cloudscape-design/global-styles/index.css'
+import './app.css'
 import Alert from '@cloudscape-design/components/alert'
 import Box from '@cloudscape-design/components/box'
+import { I18nProvider } from '@cloudscape-design/components/i18n'
+import messages from '@cloudscape-design/components/i18n/messages/all.en'
 import type { Status } from './api'
 import App from './App'
 import { loadRuntimeConfig } from './config'
@@ -33,9 +36,11 @@ const root = createRoot(document.getElementById('root')!)
 loadRuntimeConfig().then(
   () => root.render(
     <StrictMode>
-      <QueryClientProvider client={queryClient}>
-        <RouterProvider router={router} />
-      </QueryClientProvider>
+      <I18nProvider locale="en" messages={[messages]}>
+        <QueryClientProvider client={queryClient}>
+          <RouterProvider router={router} />
+        </QueryClientProvider>
+      </I18nProvider>
     </StrictMode>,
   ),
   (err: Error) => root.render(<Box padding="xxl"><Alert type="error" header="Configuration error">{err.message}</Alert></Box>),

@@ -1,0 +1,6 @@
+/* Summary cards: 7 across when wide, then 4 / 2 columns (never a single orphan card on a wide row). */
+.summary-cards { display: grid; gap: 16px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (min-width: 900px) { .summary-cards { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+@media (min-width: 1350px) { .summary-cards { grid-template-columns: repeat(7, minmax(0, 1fr)); } }
+.summary-card-label { display: flex; align-items: flex-start; gap: 6px; min-width: 0; }
+.summary-card { display: flex; flex-direction: column; justify-content: space-between; height: 100%; }

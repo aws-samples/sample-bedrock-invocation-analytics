@@ -2,6 +2,7 @@ import base64
 import gzip
 import json
 import time
+from urllib.parse import quote
 
 import jwt
 import pytest
@@ -24,18 +25,19 @@ class FakeJwks:
 
 def token(key=KEY, **overrides):
     claims = {"iss": ISSUER, "exp": int(time.time()) + 600, "token_use": "access", "client_id": CLIENT,
-              "username": "alice", "cognito:groups": ["bedrock-analytics-viewer"], **overrides}
+              "username": "alice", "cognito:groups": [], **overrides}
     return jwt.encode({k: v for k, v in claims.items() if v is not None}, key, algorithm="RS256")
 
 
 VERIFIER = auth.TokenVerifier(REGION, POOL, CLIENT, jwks_client=FakeJwks())
+ADMIN = auth.ADMIN_GROUP
 
 
 # ── auth ──
 
 def test_valid_viewer_token():
     user = VERIFIER.verify(f"Bearer {token()}")
-    assert user.username == "alice" and user.is_viewer and not user.is_admin
+    assert user.username == "alice" and not user.is_admin
 
 
 @pytest.mark.parametrize("bad", [
@@ -59,16 +61,14 @@ def test_missing_bearer(header):
         VERIFIER.verify(header)
 
 
-def test_group_requirements():
-    viewer = auth.User("v", frozenset({auth.VIEWER_GROUP}))
-    admin = auth.User("a", frozenset({auth.ADMIN_GROUP}))
-    nobody = auth.User("n", frozenset())
-    assert auth.require(admin, admin=True) is admin and auth.require(admin) is admin
+def test_any_signed_in_user_can_view_only_admin_group_can_edit():
+    admin = auth.User("a", frozenset({ADMIN, "other"}))
+    viewer = auth.User("v", frozenset({"some-other-group"}))
+    assert auth.require(admin, admin=True) is admin
+    assert auth.require(viewer) is viewer and auth.require(auth.User("n", frozenset())).username == "n"
     with pytest.raises(auth.AuthError) as e:
         auth.require(viewer, admin=True)
     assert e.value.status == 403
-    with pytest.raises(auth.AuthError):
-        auth.require(nobody)
 
 
 # ── routing ──
@@ -76,6 +76,7 @@ def test_group_requirements():
 @pytest.fixture
 def api(monkeypatch, tmp_path):
     monkeypatch.setattr(webui, "_verifier", VERIFIER)
+    monkeypatch.setattr(webui, "user_email", lambda username: f"{username}@example.com")
     (tmp_path / "assets").mkdir()
     (tmp_path / "index.html").write_text("<html>" + "x" * 2000 + "</html>")
     (tmp_path / "assets" / "app-abc123.js").write_text("console.log(1);" * 200)
@@ -84,12 +85,14 @@ def api(monkeypatch, tmp_path):
     return monkeypatch
 
 
-def call(path, method="GET", query=None, groups=("bedrock-analytics-viewer",), body=None, auth_header=True, headers=None):
+def call(path, method="GET", query=None, groups=(), body=None, auth_header=True, headers=None):
     hdrs = {"host": "alb.internal", **(headers or {})}
     if auth_header:
         hdrs["authorization"] = f"Bearer {token(**{'cognito:groups': list(groups)})}"
+    # ALB forwards query strings still percent-encoded
+    encoded = {quote(k, safe=""): quote(v, safe="") for k, v in (query or {}).items()}
     event = {"requestContext": {"elb": {"targetGroupArn": "arn:tg"}}, "httpMethod": method, "path": path,
-             "queryStringParameters": query or {}, "headers": hdrs,
+             "queryStringParameters": encoded, "headers": hdrs,
              "body": json.dumps(body) if body is not None else "", "isBase64Encoded": False}
     resp = webui.handler(event, None)
     raw = resp.get("body") or ""
@@ -129,19 +132,20 @@ def test_trend_dimension_validation(api):
     assert ok[0] == 200 and bad[0] == 400
 
 
-def test_unauthenticated_and_unauthorized(api):
+def test_unauthenticated_rejected_and_groupless_user_can_read(api):
+    api.setattr(store, "get_accounts", lambda: [])
     assert call("/api/accounts", auth_header=False)[0] == 401
-    assert call("/api/accounts", groups=())[0] == 403
+    assert call("/api/accounts", groups=())[0] == 200
 
 
 def test_pricing_write_requires_admin(api):
     saved = {}
     api.setattr(store, "save_pricing", lambda m, p, d, updated_by: saved.update(m=m, p=p, d=d, by=updated_by))
     body = {"effective_date": "2026-11-01T08:00:00+08:00", "input_per_1k": 0.003, "output_per_1k": 0.015}
-    assert call("/api/pricing/cohere.rerank-v3-5:0", method="PUT", body=body)[0] == 403
-    status, _, _ = call("/api/pricing/cohere.rerank-v3-5:0", method="PUT", body=body, groups=["bedrock-analytics-admin"])
+    assert call("/api/pricing/cohere.rerank-v3-5%3A0", method="PUT", body=body)[0] == 403
+    status, _, _ = call("/api/pricing/cohere.rerank-v3-5%3A0", method="PUT", body=body, groups=[ADMIN])
     assert status == 204
-    assert saved["m"] == "cohere.rerank-v3-5:0" and saved["d"] == "2026-11-01T00:00:00Z" and saved["by"] == "alice"
+    assert saved["m"] == "cohere.rerank-v3-5:0" and saved["d"] == "2026-11-01T00:00:00Z" and saved["by"] == "alice@example.com"
     assert saved["p"]["per_request"] == 0.0
 
 
@@ -149,7 +153,7 @@ def test_pricing_write_requires_admin(api):
 def test_pricing_write_validates_prices(api, bad):
     api.setattr(store, "save_pricing", lambda *a, **k: pytest.fail("must not save"))
     body = {"effective_date": "2026-11-01T00:00:00Z", **bad}
-    assert call("/api/pricing/m", method="PUT", body=body, groups=["bedrock-analytics-admin"])[0] == 400
+    assert call("/api/pricing/m", method="PUT", body=body, groups=[ADMIN])[0] == 400
 
 
 def test_unknown_api_route_is_json_404(api):
@@ -203,3 +207,11 @@ def test_oversized_asset_is_gzipped_even_without_accept_encoding(api, tmp_path):
     (tmp_path / "assets" / "big-abc.css").write_text(".a{color:red}" * 60_000)  # ~780 KB raw
     status, headers, body = call("/assets/big-abc.css", auth_header=False)
     assert status == 200 and headers["Content-Encoding"] == "gzip" and len(body) < 100_000
+
+
+def test_encoded_offset_and_caller_dimension_are_decoded(api):
+    seen = {}
+    api.setattr(store, "get_trend", lambda acct, s, e, dim, tz: seen.update(start=s.isoformat(), dim=dim) or [])
+    status, _, _ = call("/api/trend", query={"start": "2026-10-21T00:00:00+08:00", "end": "2026-10-28T00:00:00+08:00",
+                                             "account": "111122223333#us-west-2", "dim": "CALLER#role/My Session"})
+    assert status == 200 and seen == {"start": "2026-10-21T00:00:00+08:00", "dim": "CALLER#role/My Session"}

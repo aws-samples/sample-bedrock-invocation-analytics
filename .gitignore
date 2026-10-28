@@ -12,3 +12,6 @@ config.yaml
 # CDK
 cdk.out/
 cdk.context.json
+
+# Build output
+build/
