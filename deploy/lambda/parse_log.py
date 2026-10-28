@@ -16,7 +16,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import boto3
 
@@ -24,15 +24,16 @@ s3 = boto3.client("s3")
 
 # Spoke mode: assume hub's cross-account role to call hub's Firehose
 HUB_ROLE_ARN = os.environ.get("HUB_ROLE_ARN")
-FIREHOSE_STREAM = os.environ["FIREHOSE_STREAM"]
+FIREHOSE_STREAM = os.environ.get("FIREHOSE_STREAM", "")
 HUB_REGION = os.environ.get("HUB_REGION", os.environ.get("AWS_REGION", "us-west-2"))
 SCHEMA_VERSION = 1
-
-from datetime import timedelta
+MAX_BATCH_RECORDS = 500
+MAX_BATCH_BYTES = 4 * 1024 * 1024 - 64 * 1024  # PutRecordBatch limit is 4 MiB; keep headroom
 
 _sts = boto3.client("sts") if HUB_ROLE_ARN else None
 _hub_creds_expiry = None
 _firehose_client = None
+firehose = None
 
 
 def _get_firehose():
@@ -59,9 +60,6 @@ def _get_firehose():
             region_name=HUB_REGION,
         ).client("firehose")
     return _firehose_client
-
-
-firehose = _get_firehose()
 
 
 def handler(event, context):
@@ -104,8 +102,7 @@ def process_file(bucket, key, path_account_id, path_region):
     resp = s3.get_object(Bucket=bucket, Key=key)
     raw = gzip.decompress(resp["Body"].read()).decode("utf-8")
 
-    # Batch records for firehose.put_record_batch (up to 500 records / 4MB per batch)
-    batch = []
+    batch, batch_bytes = [], 0
     source_s3_key = f"s3://{bucket}/{key}"
 
     for line in raw.strip().splitlines():
@@ -121,24 +118,32 @@ def process_file(bucket, key, path_account_id, path_region):
         event = build_event(record, path_account_id, path_region, source_s3_key)
         if event is None:
             continue
-        batch.append({"Data": (json.dumps(event) + "\n").encode("utf-8")})
-
-        # Flush every 500 records to stay under Firehose batch limit
-        if len(batch) >= 500:
+        data = (json.dumps(event) + "\n").encode("utf-8")
+        if batch and (len(batch) >= MAX_BATCH_RECORDS or batch_bytes + len(data) > MAX_BATCH_BYTES):
             put_batch(batch)
-            batch = []
+            batch, batch_bytes = [], 0
+        batch.append({"Data": data})
+        batch_bytes += len(data)
 
     if batch:
         put_batch(batch)
 
 
-def put_batch(records):
-    """Send a batch of records to Firehose."""
-    resp = firehose.put_record_batch(DeliveryStreamName=FIREHOSE_STREAM, Records=records)
-    failed = resp.get("FailedPutCount", 0)
-    if failed:
-        # Firehose will retry async; log for visibility but don't fail the Lambda
-        print(f"Firehose put_record_batch: {failed}/{len(records)} failed (will retry)")
+PUT_ATTEMPTS = 5
+
+
+def put_batch(records, attempts=PUT_ATTEMPTS, sleep=time.sleep):
+    """Send a batch to Firehose, re-sending only rejected records with backoff.
+    Raises if records are still rejected, so the async invoke retries and then lands in the DLQ."""
+    pending = records
+    for attempt in range(attempts):
+        resp = firehose.put_record_batch(DeliveryStreamName=FIREHOSE_STREAM, Records=pending)
+        if not resp.get("FailedPutCount"):
+            return
+        pending = [rec for rec, res in zip(pending, resp["RequestResponses"]) if res.get("ErrorCode")]
+        print(f"Firehose rejected {len(pending)} records (attempt {attempt + 1}/{attempts})")
+        sleep(min(0.2 * 2 ** attempt, 3))
+    raise RuntimeError(f"Firehose still rejecting {len(pending)}/{len(records)} records after {attempts} attempts")
 
 
 def build_event(record, path_account_id, path_region, source_s3_key):
