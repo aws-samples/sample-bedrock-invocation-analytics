@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: MIT-0
 """DynamoDB data access for WebUI."""
 
-import json
 import os
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
@@ -124,12 +123,15 @@ def get_l2_checkpoint() -> dict | None:
     return resp.get("Item")
 
 
-def unpriced_models(checkpoint: dict | None) -> list[str]:
-    """Models the latest L2 run counted without a price (shown as a warning in the header)."""
+def unpriced_models(days: int = 7) -> list[str]:
+    """Models L2 counted at $0 within the last `days` (META/UNPRICED#<model>, cleared by a cost rebuild)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     try:
-        return json.loads((checkpoint or {}).get("unpriced_models") or "[]")
-    except ValueError:
+        items = _usage.query(KeyConditionExpression=Key("PK").eq("META") & Key("SK").begins_with("UNPRICED#"))["Items"]
+    except Exception as e:  # noqa: BLE001 — a warning banner must not break the dashboard
+        print(f"[WARN] Failed to read unpriced markers: {e}")
         return []
+    return sorted(i["SK"].removeprefix("UNPRICED#") for i in items if i.get("last_seen", "") >= cutoff)
 
 
 def _load_config_names() -> dict[str, str]:

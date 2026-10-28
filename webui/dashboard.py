@@ -309,7 +309,7 @@ def dashboard_page():
             lbl.text = f"Data up to: {shown.strftime('%H:%M')}"
         except ValueError:
             lbl.text = f"Data up to: {last_window_end}"
-        unpriced = data.unpriced_models(cp)
+        unpriced = data.unpriced_models()
         if unpriced:
             lbl.text += f"  ⚠ {len(unpriced)} unpriced model(s)"
             lbl.tooltip("Counted at $0 until priced: " + ", ".join(unpriced)

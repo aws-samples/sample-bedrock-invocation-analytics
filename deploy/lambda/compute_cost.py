@@ -77,6 +77,7 @@ class EventMetrics:
 
 
 def handler(event, context):
+    _pricing_cache.clear()  # warm containers must see prices added or changed since the last run
     if "rebuild" in event:
         return rebuild(event["rebuild"], datetime.now(timezone.utc))
     return run_incremental(datetime.now(timezone.utc))
@@ -127,7 +128,8 @@ def run_incremental(now: datetime):
         emit_metrics(now, watermark or start, stats)
         raise RuntimeError(f"L2 run had {stats['errors']} failed events; checkpoint held at {watermark}")
 
-    advance_checkpoint(new_watermark, now, stats, unpriced_models)
+    mark_unpriced(unpriced_models, now)
+    advance_checkpoint(new_watermark, now, stats)
     emit_metrics(now, new_watermark, stats)
     print(json.dumps({"window_end": new_watermark.isoformat(), **stats, "unpriced_models": sorted(unpriced_models)}))
     return {**stats, "window_end": new_watermark.isoformat()}
@@ -216,7 +218,23 @@ def read_checkpoint() -> dict | None:
     return {k: next(iter(v.values())) for k, v in item.items()} if item else None
 
 
-def advance_checkpoint(window_end, processed_at, stats, unpriced_models):
+def mark_unpriced(models: set[str], now: datetime):
+    """META/UNPRICED#<model> marks models counted at $0; the dashboard lists recent ones."""
+    for model in models:
+        ddb().update_item(
+            TableName=USAGE_STATS_TABLE,
+            Key={"PK": {"S": "META"}, "SK": {"S": f"UNPRICED#{model}"}},
+            UpdateExpression="SET last_seen = :now",
+            ExpressionAttributeValues={":now": {"S": now.isoformat()}},
+        )
+
+
+def clear_unpriced(models: set[str]):
+    for model in models:
+        ddb().delete_item(TableName=USAGE_STATS_TABLE, Key={"PK": {"S": "META"}, "SK": {"S": f"UNPRICED#{model}"}})
+
+
+def advance_checkpoint(window_end, processed_at, stats):
     """Move the watermark forward only (a slower concurrent run can't drag it back)."""
     try:
         ddb().put_item(
@@ -228,7 +246,6 @@ def advance_checkpoint(window_end, processed_at, stats, unpriced_models):
                 "events_processed": {"N": str(stats["processed"])},
                 "events_skipped_dup": {"N": str(stats["skipped_dup"])},
                 "events_unpriced": {"N": str(stats["unpriced"])},
-                "unpriced_models": {"S": json.dumps(sorted(unpriced_models)[:20])},
             },
             ConditionExpression="attribute_not_exists(last_window_end) OR last_window_end <= :w",
             ExpressionAttributeValues={":w": {"S": window_end.isoformat()}},
@@ -274,12 +291,12 @@ def rebuild(spec: dict, now: datetime):
     events = query_events(f"ts >= {_ts_literal(start)} AND ts < {_ts_literal(end)}", timeout_s=180)
     rows: dict[tuple[str, str], dict[str, int]] = {}
     unpriced: set[str] = set()
+    priced: set[str] = set()
     for ev in events:
         m = to_metrics(ev, get_pricing)
         if m is None:
             continue
-        if m.unpriced:
-            unpriced.add(m.model_id)
+        (unpriced if m.unpriced else priced).add(m.model_id)
         for dim in m.dims:
             row = rows.setdefault((m.pk, f"HOURLY#{m.hour_key}#{dim}"), defaultdict(int))
             merge_into(row, m)
@@ -304,6 +321,8 @@ def rebuild(spec: dict, now: datetime):
             batch.put_item(Item={"PK": pk, "SK": sk, "ttl": ttl, "rebuilt_at": now.isoformat(), **values})
             written += 1
 
+    clear_unpriced(priced - unpriced)
+    mark_unpriced(unpriced, now)
     result = {"start": start.isoformat(), "end": end.isoformat(), "events": len(events),
               "rebuilt_rows": written, "deleted_rows": len(stale), "unpriced_models": sorted(unpriced)}
     print(json.dumps(result))
