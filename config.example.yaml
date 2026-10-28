@@ -2,11 +2,15 @@
 # Copy this file to config.yaml and edit with your account details.
 #
 # The account marked 'primary: true' deploys the full stack (DynamoDB, Pricing, Aggregate, WebUI).
-# Other accounts deploy a lightweight spoke stack (S3, Bedrock logging, ETL Lambda → writes to primary DynamoDB).
+# Other accounts deploy a lightweight spoke stack (S3, Bedrock logging, parse_log Lambda → primary account's Firehose).
 
 data:
   bedrock_log_prefix: bedrock/invocation-logs/
-  cost_agg_interval_min: 5        # must be > 1 (Firehose buffer); recommended ≥ 3
+  cost_agg_interval_min: 5        # minutes between L2 runs; >= 2 (Firehose buffers 60s)
+
+# Alarm notifications (optional). Confirm the SNS subscription email after deploy.
+alerts:
+  email: ""
 
 # WebUI settings
 webui:
