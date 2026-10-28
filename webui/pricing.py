@@ -7,6 +7,24 @@ from datetime import datetime, timezone
 from nicegui import ui
 from webui import data
 
+PRICE_LABELS = {
+    "input_per_1k": "Input $/1K tokens",
+    "output_per_1k": "Output $/1K tokens",
+    "cache_read_per_1k": "Cache read $/1K tokens",
+    "cache_write_per_1k": "Cache write (5 min) $/1K tokens",
+    "cache_write_1h_per_1k": "Cache write (1 h) $/1K tokens (0 = use 5 min price)",
+    "per_request": "Per request $ (rerank / image generation)",
+}
+
+
+def _price_summary(r: dict) -> str:
+    if r["per_request"]:
+        return f'${r["per_request"]:.4f}/request'
+    parts = [f'In {r["input_per_1k"]:.6f}', f'Out {r["output_per_1k"]:.6f}']
+    if r["cache_read_per_1k"] or r["cache_write_per_1k"]:
+        parts.append(f'Cache R {r["cache_read_per_1k"]:.6f} / W {r["cache_write_per_1k"]:.6f}')
+    return " · ".join(parts)
+
 
 @ui.page("/pricing")
 def pricing_page():
@@ -30,8 +48,8 @@ def pricing_page():
     with ui.dialog() as edit_dialog, ui.card().classes("min-w-[400px]"):
         dlg_title = ui.label("").classes("text-lg font-semibold")
         dlg_model = ui.input(label="Model ID").classes("w-full")
-        dlg_input = ui.number(label="Input $/1K tokens", format="%.6f").classes("w-full")
-        dlg_output = ui.number(label="Output $/1K tokens", format="%.6f").classes("w-full mt-2")
+        dlg_prices = {f: ui.number(label=label, format="%.9f", min=0).classes("w-full")
+                      for f, label in PRICE_LABELS.items()}
         dlg_date = ui.input(label="Effective Date (ISO 8601)").classes("w-full mt-2")
         with ui.row().classes("w-full justify-end mt-4 gap-2"):
             ui.button("Cancel", on_click=edit_dialog.close).props("flat")
@@ -39,15 +57,18 @@ def pricing_page():
 
     edit_ctx = {}
 
-    def open_edit(model_id="", input_per_1k=0, output_per_1k=0, effective_date="", is_new=True):
+    def open_edit(model_id="", record: dict | None = None, is_new=True):
+        record = record or {}
+        effective_date = record.get("effective_date", "")
         edit_ctx.update(is_new=is_new, original_date=effective_date, model_id=model_id)
         dlg_title.text = "Add Pricing" if is_new else "Edit Pricing"
         dlg_model.value = model_id
-        dlg_model.props("readonly" if (model_id and not is_new) else "")
-        if not model_id or is_new:
+        if model_id and not is_new:
+            dlg_model.props("readonly")
+        else:
             dlg_model.props(remove="readonly")
-        dlg_input.value = input_per_1k
-        dlg_output.value = output_per_1k
+        for f, field in dlg_prices.items():
+            field.value = record.get(f, 0)
         dlg_date.value = effective_date or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         edit_dialog.open()
 
@@ -56,12 +77,16 @@ def pricing_page():
         if not model_id:
             ui.notify("Model ID is required", type="warning")
             return
-        data.save_pricing(model_id, dlg_input.value or 0, dlg_output.value or 0, dlg_date.value)
+        try:
+            datetime.fromisoformat(dlg_date.value.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            ui.notify("Effective date must be ISO 8601, e.g. 2026-01-01T00:00:00Z", type="warning")
+            return
+        data.save_pricing(model_id, {f: field.value or 0 for f, field in dlg_prices.items()}, dlg_date.value)
         if not edit_ctx["is_new"] and edit_ctx["original_date"] != dlg_date.value:
             data.delete_pricing(model_id, edit_ctx["original_date"])
-        ui.notify(f"Saved pricing for {model_id}", type="positive")
+        ui.notify(f"Saved pricing for {model_id}. Run scripts/rebuild_costs.sh to reprice past usage.", type="positive")
         edit_dialog.close()
-        # Refresh history dialog if open
         if history_dialog.value and edit_ctx["model_id"]:
             show_history(edit_ctx["model_id"])
 
@@ -105,14 +130,12 @@ def pricing_page():
             for r in records:
                 with ui.row().classes("w-full items-center py-1 px-2 hover:bg-gray-50 rounded gap-2 flex-nowrap"):
                     ui.label(r["effective_date"]).classes("text-sm min-w-[180px]")
-                    ui.label(f'In: {r["input_per_1k"]:.6f}').classes("text-sm min-w-[120px]")
-                    ui.label(f'Out: {r["output_per_1k"]:.6f}').classes("text-sm min-w-[120px]")
+                    ui.label(_price_summary(r)).classes("text-sm min-w-[320px]")
                     ui.badge(r["source"], color="blue-3" if r["source"] == "litellm" else "orange-3")
                     ui.space()
                     with ui.row().classes("gap-0 flex-nowrap"):
                         ui.button(icon="edit", on_click=lambda _r=r: open_edit(
-                            model_id=_r["model_id"], input_per_1k=_r["input_per_1k"],
-                            output_per_1k=_r["output_per_1k"], effective_date=_r["effective_date"], is_new=False,
+                            model_id=_r["model_id"], record=_r, is_new=False,
                         )).props("flat dense round size=sm color=primary")
                         ui.button(icon="delete", on_click=lambda _r=r: open_delete(
                             _r["model_id"], _r["effective_date"],
@@ -133,6 +156,7 @@ def pricing_page():
             {"name": "model_id", "label": "Model ID", "field": "model_id", "align": "left", "sortable": True},
             {"name": "input_per_1k", "label": "Input $/1K tokens", "field": "input_per_1k", "sortable": True},
             {"name": "output_per_1k", "label": "Output $/1K tokens", "field": "output_per_1k", "sortable": True},
+            {"name": "per_request", "label": "$/request", "field": "per_request", "sortable": True},
             {"name": "effective_date", "label": "Effective Date", "field": "effective_date", "sortable": True},
             {"name": "source", "label": "Source", "field": "source", "sortable": True},
         ]
@@ -140,6 +164,7 @@ def pricing_page():
             "model_id": m["model_id"],
             "input_per_1k": f'{m["input_per_1k"]:.6f}',
             "output_per_1k": f'{m["output_per_1k"]:.6f}',
+            "per_request": f'{m["per_request"]:.4f}' if m["per_request"] else "",
             "effective_date": m["effective_date"],
             "source": m["source"],
         } for m in models]

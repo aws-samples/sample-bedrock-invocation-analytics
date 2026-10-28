@@ -102,12 +102,7 @@ def _fetch_dashboard_data(account_region: str, start_dt: datetime, end_dt: datet
     `tz` shapes get_trend's bucketing so the trend series has tz-aligned, equal-spaced
     buckets (the in-progress bucket — today/this month — is synthesised from finer rows).
     """
-    return {
-        "summary": data.get_summary(account_region, start_dt, end_dt),
-        "models": data.get_by_model(account_region, start_dt, end_dt),
-        "callers": data.get_by_caller(account_region, start_dt, end_dt),
-        "trend_total": data.get_trend(account_region, start_dt, end_dt, "TOTAL", tz),
-    }
+    return data.get_dashboard_bundle(account_region, start_dt, end_dt, tz)
 
 
 def _fetch_trend(account_region: str, start_dt: datetime, end_dt: datetime, dim: str, tz: ZoneInfo) -> list[dict]:
@@ -167,11 +162,11 @@ def dashboard_page():
         ui.label("Bedrock Invocation Analytics").classes("text-xl font-bold ml-2")
         ui.space()
         last_updated_label["label"] = ui.label("").classes("text-xs text-gray-400 mr-3").tooltip(
-            "Latest window processed by L2 compute_cost. Data freshness lags real time "
-            "by ~5-7 min (Firehose buffer + L2 5min schedule)."
+            "Events ingested up to this time are included. Expect a few minutes of lag "
+            "(Firehose 60s buffer + L2 schedule)."
         )
         auto_refresh = ui.select(
-            {0: "Off", 10: "10s", 30: "30s", 60: "1min", 300: "5min"},
+            {0: "Off", 60: "1min", 300: "5min"},
             value=0, label="Auto",
         ).props("dense outlined").classes("w-24").tooltip("Auto refresh interval")
         refresh_btn = ui.button(icon="refresh", on_click=lambda: refresh_data()).props("flat round").tooltip("Refresh")
@@ -312,8 +307,13 @@ def dashboard_page():
             dt_utc = datetime.fromisoformat(last_window_end.replace("Z", "+00:00"))
             shown = dt_utc.astimezone(state["tz"])
             lbl.text = f"Data up to: {shown.strftime('%H:%M')}"
-        except Exception:
+        except ValueError:
             lbl.text = f"Data up to: {last_window_end}"
+        unpriced = data.unpriced_models(cp)
+        if unpriced:
+            lbl.text += f"  ⚠ {len(unpriced)} unpriced model(s)"
+            lbl.tooltip("Counted at $0 until priced: " + ", ".join(unpriced)
+                        + ". Add prices on the Pricing page, then run scripts/rebuild_costs.sh.")
 
     async def rebuild():
         """Full DOM rebuild — used when account/region/range change."""
@@ -430,11 +430,12 @@ _CAT_COLOR = {
     "cache_read": "#b6d634",   # green
     "cache_write": "#f97317",  # orange
     "output": "#01b7d4",       # cyan
+    "request": "#9a60b4",      # purple — per-request priced models (rerank, image generation)
 }
 
 
 def _usage_cost_bar_option(x_labels, input_tok, output_tok, cache_read_tok, cache_write_tok,
-                           cost_in, cost_out, cost_cr, cost_cw) -> dict:
+                           cost_in, cost_out, cost_cr, cost_cw, cost_req) -> dict:
     """Three bars per x: an input-token stack, an output-token bar, and a cost stack.
 
     Cache reads/writes are input-side tokens (prompt caching only caches input), so they
@@ -461,6 +462,7 @@ def _usage_cost_bar_option(x_labels, input_tok, output_tok, cache_read_tok, cach
             {"name": "Cache Read $", "type": "bar", "stack": "cost", "yAxisIndex": 1, "itemStyle": {"color": _CAT_COLOR["cache_read"], "decal": _COST_DECAL}, "data": cost_cr},
             {"name": "Cache Write $", "type": "bar", "stack": "cost", "yAxisIndex": 1, "itemStyle": {"color": _CAT_COLOR["cache_write"], "decal": _COST_DECAL}, "data": cost_cw},
             {"name": "Output $", "type": "bar", "stack": "cost", "yAxisIndex": 1, "itemStyle": {"color": _CAT_COLOR["output"], "decal": _COST_DECAL}, "data": cost_out},
+            {"name": "Request $", "type": "bar", "stack": "cost", "yAxisIndex": 1, "itemStyle": {"color": _CAT_COLOR["request"], "decal": _COST_DECAL}, "data": cost_req},
         ],
     }
 
@@ -497,7 +499,7 @@ def _apply_updates(dashboard_data: dict, trend_data: dict, ttft_data: list, refs
                        ("Cache Read Tokens", "cache_read_tokens"), ("Cache Write Tokens", "cache_write_tokens")]:
             _set_series_data(ch, s, [m.get(key, 0) for m in top_models])
         for s, key in [("Cache Read $", "cost_cache_read"), ("Cache Write $", "cost_cache_write"),
-                       ("Input $", "cost_input"), ("Output $", "cost_output")]:
+                       ("Input $", "cost_input"), ("Output $", "cost_output"), ("Request $", "cost_request")]:
             _set_series_data(ch, s, [round(m[key], 4) for m in top_models])
         ch.update()
 
@@ -513,7 +515,7 @@ def _apply_updates(dashboard_data: dict, trend_data: dict, ttft_data: list, refs
                        ("Cache Read Tokens", "cache_read_tokens"), ("Cache Write Tokens", "cache_write_tokens")]:
             _set_series_data(ch, s, [c.get(key, 0) for c in top_callers])
         for s, key in [("Cache Read $", "cost_cache_read"), ("Cache Write $", "cost_cache_write"),
-                       ("Input $", "cost_input"), ("Output $", "cost_output")]:
+                       ("Input $", "cost_input"), ("Output $", "cost_output"), ("Request $", "cost_request")]:
             _set_series_data(ch, s, [round(c[key], 4) for c in top_callers])
         ch.update()
 
@@ -642,6 +644,7 @@ def render_dashboard(account_region: str, start_dt: datetime, end_dt: datetime, 
                         [round(m["cost_output"], 4) for m in models[:15]],
                         [round(m["cost_cache_read"], 4) for m in models[:15]],
                         [round(m["cost_cache_write"], 4) for m in models[:15]],
+                        [round(m["cost_request"], 4) for m in models[:15]],
                     )).classes("w-full h-96")
                 with ui.tab_panel("table"):
                     ui.table(
@@ -654,6 +657,7 @@ def render_dashboard(account_region: str, start_dt: datetime, end_dt: datetime, 
                             {"name": "cost_cache_write", "label": "Cache Write ($)", "field": "cost_cache_write", "sortable": True},
                             {"name": "cost_input", "label": "Input ($)", "field": "cost_input", "sortable": True},
                             {"name": "cost_output", "label": "Output ($)", "field": "cost_output", "sortable": True},
+                            {"name": "cost_request", "label": "Per request ($)", "field": "cost_request", "sortable": True},
                             {"name": "cost", "label": "Total ($)", "field": "cost", "sortable": True},
                         ],
                         rows=[{
@@ -662,6 +666,7 @@ def render_dashboard(account_region: str, start_dt: datetime, end_dt: datetime, 
                             "cost_cache_write": round(m["cost_cache_write"], 4),
                             "cost_input": round(m["cost_input"], 4),
                             "cost_output": round(m["cost_output"], 4),
+                            "cost_request": round(m["cost_request"], 4),
                             "cost": round(m["cost_usd"], 4),
                         } for m in models],
                     ).classes("w-full")
@@ -708,6 +713,7 @@ def render_dashboard(account_region: str, start_dt: datetime, end_dt: datetime, 
                         [round(c["cost_output"], 4) for c in callers[:15]],
                         [round(c["cost_cache_read"], 4) for c in callers[:15]],
                         [round(c["cost_cache_write"], 4) for c in callers[:15]],
+                        [round(c["cost_request"], 4) for c in callers[:15]],
                     )).classes("w-full h-96")
                 with ui.tab_panel("table"):
                     ui.table(
@@ -720,6 +726,7 @@ def render_dashboard(account_region: str, start_dt: datetime, end_dt: datetime, 
                             {"name": "cost_cache_write", "label": "Cache Write ($)", "field": "cost_cache_write", "sortable": True},
                             {"name": "cost_input", "label": "Input ($)", "field": "cost_input", "sortable": True},
                             {"name": "cost_output", "label": "Output ($)", "field": "cost_output", "sortable": True},
+                            {"name": "cost_request", "label": "Per request ($)", "field": "cost_request", "sortable": True},
                             {"name": "cost", "label": "Total ($)", "field": "cost", "sortable": True},
                         ],
                         rows=[{
@@ -728,6 +735,7 @@ def render_dashboard(account_region: str, start_dt: datetime, end_dt: datetime, 
                             "cost_cache_write": round(c["cost_cache_write"], 4),
                             "cost_input": round(c["cost_input"], 4),
                             "cost_output": round(c["cost_output"], 4),
+                            "cost_request": round(c["cost_request"], 4),
                             "cost": round(c["cost_usd"], 4),
                         } for c in callers],
                     ).classes("w-full")

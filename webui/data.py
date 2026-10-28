@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT-0
 """DynamoDB data access for WebUI."""
 
+import json
 import os
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
@@ -123,6 +124,14 @@ def get_l2_checkpoint() -> dict | None:
     return resp.get("Item")
 
 
+def unpriced_models(checkpoint: dict | None) -> list[str]:
+    """Models the latest L2 run counted without a price (shown as a warning in the header)."""
+    try:
+        return json.loads((checkpoint or {}).get("unpriced_models") or "[]")
+    except ValueError:
+        return []
+
+
 def _load_config_names() -> dict[str, str]:
     """Map profile → friendly name from config.yaml. Best-effort; returns {} on any failure.
     Also keyed by account_id once resolved (we can't resolve profile → account_id here, so
@@ -213,65 +222,74 @@ def query_usage(account_region: str, segments: list[tuple[str, str, str]], dimen
     return out
 
 
+COST_FIELDS = ("cost_usd", "cost_input", "cost_output", "cost_cache_read", "cost_cache_write", "cost_request")
+TOKEN_FIELDS = ("invocations", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+
+
+def get_dashboard_bundle(account_region: str, start_dt: datetime, end_dt: datetime, tz: tzinfo | None = None) -> dict:
+    """Summary, by-model, by-caller and TOTAL trend from a single pass over the storage segments."""
+    items = query_usage(account_region, _plan_segments(start_dt, end_dt))
+    totals = [i for i in items if i["dimension"] == "TOTAL"]
+    return {
+        "summary": summarize(totals),
+        "models": group_by_model([i for i in items if i["dimension"].startswith("MODEL#")]),
+        "callers": group_by_caller([i for i in items if i["dimension"].startswith("CALLER#")]),
+        "trend_total": _rebucket(totals, _pick_display_granularity(start_dt, end_dt), tz or timezone.utc),
+    }
+
+
 def get_summary(account_region: str, start_dt: datetime, end_dt: datetime) -> dict:
-    """Get summary stats for dashboard cards."""
-    items = query_usage(account_region, _plan_segments(start_dt, end_dt), "TOTAL")
+    return summarize(query_usage(account_region, _plan_segments(start_dt, end_dt), "TOTAL"))
 
-    total = {"invocations": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.0, "latency_sum_ms": 0, "tpot_sum": 0, "tpot_count": 0}
+
+def get_by_model(account_region: str, start_dt: datetime, end_dt: datetime) -> list[dict]:
+    return group_by_model(query_usage(account_region, _plan_segments(start_dt, end_dt), "MODEL#"))
+
+
+def get_by_caller(account_region: str, start_dt: datetime, end_dt: datetime) -> list[dict]:
+    return group_by_caller(query_usage(account_region, _plan_segments(start_dt, end_dt), "CALLER#"))
+
+
+def summarize(items: list[dict]) -> dict:
+    """Totals for the summary cards from TOTAL rows."""
+    total = {k: 0 for k in (*TOKEN_FIELDS, "latency_sum_ms", "tpot_sum", "tpot_count")}
+    total["cost_usd"] = 0.0
     for item in items:
-        for k in ("invocations", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "tpot_sum", "tpot_count"):
+        for k in total:
             total[k] += item.get(k, 0)
-        total["cost_usd"] += item.get("cost_usd", 0.0)
-        total["latency_sum_ms"] += item.get("latency_sum_ms", 0)
-
     total["avg_latency_ms"] = round(total["latency_sum_ms"] / total["invocations"]) if total["invocations"] else 0
     total["avg_tpot"] = round(total["tpot_sum"] / total["tpot_count"] / 1000, 2) if total["tpot_count"] else 0
     return total
 
 
-def get_by_model(account_region: str, start_dt: datetime, end_dt: datetime) -> list[dict]:
-    """Get usage grouped by model."""
-    items = query_usage(account_region, _plan_segments(start_dt, end_dt), "MODEL#")
-
-    # Aggregate across time periods by model
-    models = {}
+def group_by_model(items: list[dict]) -> list[dict]:
+    models: dict[str, dict] = {}
     for item in items:
-        model = item["dimension"].replace("MODEL#", "")
-        if model not in models:
-            models[model] = {"model": model, "invocations": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.0, "cost_input": 0.0, "cost_output": 0.0, "cost_cache_read": 0.0, "cost_cache_write": 0.0, "latency_sum_ms": 0, "max_latency_ms": 0, "min_latency_ms": 0, "tpot_max": 0, "tpot_min": 0, "tpot_sum": 0, "tpot_count": 0}
-        for k in ("invocations", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "latency_sum_ms", "tpot_sum", "tpot_count"):
-            models[model][k] += item.get(k, 0)
-        for k in ("cost_usd", "cost_input", "cost_output", "cost_cache_read", "cost_cache_write"):
-            models[model][k] += item.get(k, 0.0)
-        models[model]["max_latency_ms"] = max(models[model]["max_latency_ms"], item.get("max_latency_ms", 0))
-        models[model]["tpot_max"] = max(models[model]["tpot_max"], item.get("tpot_max", 0))
+        model = item["dimension"].removeprefix("MODEL#")
+        m = models.setdefault(model, {"model": model, **{k: 0 for k in TOKEN_FIELDS}, **{k: 0.0 for k in COST_FIELDS},
+                                      "latency_sum_ms": 0, "max_latency_ms": 0, "min_latency_ms": 0,
+                                      "tpot_max": 0, "tpot_min": 0, "tpot_sum": 0, "tpot_count": 0})
+        for k in (*TOKEN_FIELDS, *COST_FIELDS, "latency_sum_ms", "tpot_sum", "tpot_count"):
+            m[k] += item.get(k, 0)
+        m["max_latency_ms"] = max(m["max_latency_ms"], item.get("max_latency_ms", 0))
+        m["tpot_max"] = max(m["tpot_max"], item.get("tpot_max", 0))
         for f in ("min_latency_ms", "tpot_min"):
             v = item.get(f, 0)
             if v > 0:
-                cur = models[model][f]
-                models[model][f] = v if cur == 0 else min(cur, v)
-
+                m[f] = v if m[f] == 0 else min(m[f], v)
     for m in models.values():
         m["avg_latency_ms"] = round(m["latency_sum_ms"] / m["invocations"]) if m["invocations"] else 0
         m["tpot_avg"] = round(m["tpot_sum"] / m["tpot_count"] / 1000, 2) if m["tpot_count"] else 0
-
     return sorted(models.values(), key=lambda x: x["cost_usd"], reverse=True)
 
 
-def get_by_caller(account_region: str, start_dt: datetime, end_dt: datetime) -> list[dict]:
-    """Get usage grouped by caller."""
-    items = query_usage(account_region, _plan_segments(start_dt, end_dt), "CALLER#")
-
-    callers = {}
+def group_by_caller(items: list[dict]) -> list[dict]:
+    callers: dict[str, dict] = {}
     for item in items:
-        caller = item["dimension"].replace("CALLER#", "")
-        if caller not in callers:
-            callers[caller] = {"caller": caller, "invocations": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.0, "cost_input": 0.0, "cost_output": 0.0, "cost_cache_read": 0.0, "cost_cache_write": 0.0}
-        for k in ("invocations", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"):
-            callers[caller][k] += item.get(k, 0)
-        for k in ("cost_usd", "cost_input", "cost_output", "cost_cache_read", "cost_cache_write"):
-            callers[caller][k] += item.get(k, 0.0)
-
+        caller = item["dimension"].removeprefix("CALLER#")
+        c = callers.setdefault(caller, {"caller": caller, **{k: 0 for k in TOKEN_FIELDS}, **{k: 0.0 for k in COST_FIELDS}})
+        for k in (*TOKEN_FIELDS, *COST_FIELDS):
+            c[k] += item.get(k, 0)
     return sorted(callers.values(), key=lambda x: x["cost_usd"], reverse=True)
 
 
@@ -339,7 +357,7 @@ def _rebucket(rows: list[dict], target: str, tz: tzinfo) -> list[dict]:
 
     SUMMABLE = ("invocations", "input_tokens", "output_tokens", "cache_read_tokens",
                 "cache_write_tokens", "cost_micro_usd", "cost_input", "cost_output",
-                "cost_cache_read", "cost_cache_write", "latency_sum_ms",
+                "cost_cache_read", "cost_cache_write", "cost_request", "latency_sum_ms",
                 "tpot_sum", "tpot_count", "ttft_avg", "ttft_p99")
 
     groups: dict[str, dict] = {}
@@ -381,35 +399,28 @@ def _extract_dimension(sk: str) -> str:
     return parts[2] if len(parts) >= 3 else ""
 
 
+PRICE_FIELDS = ("input_per_1k", "output_per_1k", "cache_read_per_1k", "cache_write_per_1k",
+                "cache_write_1h_per_1k", "per_request")
+
+
+def _pricing_record(model_id: str, item: dict) -> dict:
+    return {"model_id": model_id, "effective_date": item["SK"], "source": item.get("source", ""),
+            **{f: float(item.get(f, 0) or 0) for f in PRICE_FIELDS}}
+
+
 def get_all_pricing() -> list[dict]:
-    """Get current effective price for all models."""
-    # Scan all MODEL# items, then pick latest SK per model
+    """Current effective price per model (latest SK). Full scan; the table holds ~1K items."""
     resp = _pricing.scan()
     items = resp.get("Items", [])
     while resp.get("LastEvaluatedKey"):
         resp = _pricing.scan(ExclusiveStartKey=resp["LastEvaluatedKey"])
         items.extend(resp.get("Items", []))
-
-    # Group by PK, pick latest SK (= current effective price)
-    models: dict[str, dict] = {}
+    latest: dict[str, dict] = {}
     for item in items:
         pk = item["PK"]
-        if not pk.startswith("MODEL#"):
-            continue
-        if pk not in models or item["SK"] > models[pk]["SK"]:
-            models[pk] = item
-
-    result = []
-    for pk, item in sorted(models.items()):
-        model_id = pk.replace("MODEL#", "")
-        result.append({
-            "model_id": model_id,
-            "input_per_1k": float(item.get("input_per_1k", 0)),
-            "output_per_1k": float(item.get("output_per_1k", 0)),
-            "effective_date": item["SK"],
-            "source": item.get("source", ""),
-        })
-    return result
+        if pk.startswith("MODEL#") and (pk not in latest or item["SK"] > latest[pk]["SK"]):
+            latest[pk] = item
+    return [_pricing_record(pk.removeprefix("MODEL#"), item) for pk, item in sorted(latest.items())]
 
 
 def get_pricing_sync_info() -> dict | None:
@@ -448,30 +459,20 @@ def get_ttft_trend(model_id: str, start_dt: datetime, end_dt: datetime) -> list[
              "ttft_p99": round(results.get("p99", {}).get(t, 0))} for t in timestamps]
 
 
-def save_pricing(model_id: str, input_per_1k: float, output_per_1k: float, effective_date: str):
-    """Save a manual pricing record."""
+def save_pricing(model_id: str, prices: dict[str, float], effective_date: str):
+    """Save a manual pricing record with every price field, so cache and per-request prices aren't dropped."""
     _pricing.put_item(Item={
         "PK": f"MODEL#{model_id}",
         "SK": effective_date,
-        "input_per_1k": str(round(input_per_1k, 6)),
-        "output_per_1k": str(round(output_per_1k, 6)),
+        **{f: format(round(float(prices.get(f) or 0), 9), "f").rstrip("0").rstrip(".") or "0" for f in PRICE_FIELDS},
         "source": "manual",
     })
 
 
 def get_pricing_history(model_id: str) -> list[dict]:
-    """Get all pricing records for a model, newest first."""
-    resp = _pricing.query(
-        KeyConditionExpression=Key("PK").eq(f"MODEL#{model_id}"),
-        ScanIndexForward=False,
-    )
-    return [{
-        "model_id": model_id,
-        "input_per_1k": float(item.get("input_per_1k", 0)),
-        "output_per_1k": float(item.get("output_per_1k", 0)),
-        "effective_date": item["SK"],
-        "source": item.get("source", ""),
-    } for item in resp.get("Items", [])]
+    """All pricing records for a model, newest first."""
+    resp = _pricing.query(KeyConditionExpression=Key("PK").eq(f"MODEL#{model_id}"), ScanIndexForward=False)
+    return [_pricing_record(model_id, item) for item in resp.get("Items", [])]
 
 
 def delete_pricing(model_id: str, effective_date: str):
@@ -514,6 +515,7 @@ def _format_item(item: dict) -> dict:
         "cost_output": int(item.get("cost_output_micro", 0)) / 1_000_000,
         "cost_cache_read": int(item.get("cost_cache_read_micro", 0)) / 1_000_000,
         "cost_cache_write": int(item.get("cost_cache_write_micro", 0)) / 1_000_000,
+        "cost_request": int(item.get("cost_request_micro", 0)) / 1_000_000,
         "latency_sum_ms": latency_sum,
         "avg_latency_ms": round(latency_sum / invocations) if invocations else 0,
         "max_latency_ms": int(item.get("max_latency_ms", 0)),
