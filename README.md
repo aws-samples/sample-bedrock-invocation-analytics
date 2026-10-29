@@ -40,7 +40,7 @@ Real-time analytics for Amazon Bedrock — monitor token usage, costs, and perfo
 │   └── lambda/
 │       ├── parse_log.py      # L1: S3 event → normalized JSON → Firehose
 │       ├── compute_cost.py   # L2: Athena (Iceberg) → pricing → DynamoDB
-│       ├── aggregate_stats.py # Rollup: HOURLY → DAILY → MONTHLY
+│       ├── pricing.py        # Price versions and the SQL price table
 │       └── sync_pricing.py   # Weekly pricing sync from LiteLLM
 │   ├── common.py             # Shared constructs (log bucket, Lambda, alarms)
 │   └── custom_resources/     # Bedrock logging, Lake Formation admin, IAM wait
@@ -51,6 +51,7 @@ Real-time analytics for Amazon Bedrock — monitor token usage, costs, and perfo
 ├── scripts/
 │   ├── seed_pricing.py       # Seed pricing from LiteLLM
 │   ├── rebuild_costs.sh      # Reprice past usage from Iceberg
+│   ├── reconcile.py          # Read-only check: DynamoDB aggregates vs Iceberg
 │   └── build_webui.sh        # Build the SPA and the WebUI Lambda package
 ├── tests/                    # Unit tests (uv run pytest)
 ├── config.example.yaml       # Multi-account deployment config
@@ -76,7 +77,7 @@ Two-stage pipeline: **L1** (parse) turns every Bedrock call into a structured ev
 │                                                           │                  │
 │                                  ┌────────────────────────┤                  │
 │                                  │                        │                  │
-│                                  ▼ every 5 min            │                  │
+│                                  ▼ every 5 min + hourly   │                  │
 │                    Lambda: compute_cost                   │                  │
 │                    [L2: pricing + aggregation]            │                  │
 │                          │                                │                  │
@@ -89,7 +90,6 @@ Two-stage pipeline: **L1** (parse) turns every Bedrock call into a structured ev
 │     (API + SPA)          ▲ intranet                    Cognito sign-in       │
 │                                                                              │
 │  DynamoDB: model-pricing ◄── Lambda: sync_pricing (weekly)                   │
-│  Lambda: aggregate_stats (HOURLY → DAILY → MONTHLY, daily/monthly)           │
 │  IAM Role: SpokeWriteRole (assumed by spokes to write hub Firehose)          │
 └──────────────────────────────────────────────────────────────────────────────┘
        ▲ assume role + cross-account firehose:PutRecord
@@ -107,9 +107,13 @@ Two-stage pipeline: **L1** (parse) turns every Bedrock call into a structured ev
 
 1. **Bedrock logs** land in each account's own S3 bucket (Bedrock requires same-account/region sinks).
 2. **L1 `parse_log`** (per-account Lambda, triggered by S3 events) normalizes each record into a flat JSON event (account, region, model, caller, token counts, cache split, latency, error code) and hands it to Hub's Firehose via `PutRecordBatch`. Spoke Lambdas assume a cross-account role.
-3. **Firehose → S3 Tables**: Firehose buffers ~60s then upserts into the Iceberg table `bedrock_analytics.usage_events`, using `request_id` as the unique key — this is the **source of truth** for every Bedrock call, also directly queryable via Athena for ad-hoc investigation.
-4. **L2 `compute_cost`** (hub only, EventBridge every `cost_agg_interval_min`) reads events ingested since its checkpoint from Iceberg via Athena, looks up time-aware pricing in DynamoDB, computes cost (splitting 5m vs 1h prompt cache), and aggregates into DynamoDB via `TransactWriteItems` with a dedup guard. A failed run keeps the checkpoint, so the next run retries. Separating compute from parse means a pricing fix only needs `scripts/rebuild_costs.sh` over Iceberg — no re-parsing raw S3.
-5. **`aggregate_stats`** rolls hourly → daily → monthly on schedule, recomputing recent days so late events are included. **`sync_pricing`** pulls the latest model prices from [LiteLLM](https://github.com/BerriAI/litellm) weekly.
+3. **Firehose → S3 Tables**: Firehose buffers ~60s then appends to the Iceberg table `bedrock_analytics.usage_events`, the **source of truth** for every Bedrock call, also directly queryable via Athena. The table is append-only, so a retried delivery can add a duplicate row; every reader deduplicates by `request_id`.
+4. **L2 `compute_cost`** (hub only) never adds to a counter. Each run recomputes whole periods in one Athena query (dedup by `request_id`, time-aware prices, 5m vs 1h prompt cache split) and replaces that period's rows in DynamoDB, so reruns and overlaps are harmless:
+   - **incremental** (every `cost_agg_interval_min`): recomputes the hours that received new events since its checkpoint, plus the current and previous hour. A failed run keeps the checkpoint.
+   - **settle** (hourly): recomputes the last 2 completed days, days that got late events, and days whose count no longer matches Iceberg (daily check over 90 days); writes DAILY rows, and MONTHLY rows once a month is complete. `META/SETTLED#<account>#<region>` records the last day settled; the dashboard reads DAILY up to it and HOURLY after it.
+   - **rebuild** (`scripts/rebuild_costs.sh`): the same recompute over any range, for repricing.
+   A lease lock keeps the three from running at once. Separating compute from parse means a pricing fix only needs a rebuild over Iceberg, no re-parsing of raw S3.
+5. **`sync_pricing`** pulls the latest model prices from [LiteLLM](https://github.com/BerriAI/litellm) weekly.
 6. **WebUI**: a React SPA and a JSON API served by one Lambda behind an internal ALB (optionally fronted by CloudFront through a VPC origin). It reads DynamoDB (sub-second) as a serving-layer cache and checks Cognito access tokens on every API call. The header shows *"Data up to X"* based on L2's checkpoint, so users can tell real-time data freshness apart from UI refresh time.
 
 ## Prerequisites
@@ -158,15 +162,15 @@ uv sync
 | S3 ops bucket | Athena results (7-day expiry) and Firehose error backups (90-day expiry) |
 | KMS key | Raw-log bucket encryption and alarm topic |
 | Custom Resources | Bedrock invocation logging (merges with existing config, never overwrites another destination); Lake Formation admin for the CDK deploy role (adds to the admin list instead of replacing it) |
-| DynamoDB × 2 | `usage-stats` (serving layer + DEDUP + META) and `model-pricing` (time-aware); PITR and deletion protection |
+| DynamoDB × 2 | `usage-stats` (HOURLY / DAILY / MONTHLY aggregates + META) and `model-pricing` (time-aware); PITR and deletion protection |
 | S3 Tables bucket + namespace + Iceberg table | `usage_events` — source of truth, queryable via Athena |
 | Glue Data Catalog (federated) | `s3tablescatalog` pointing at the S3 Tables bucket |
-| Firehose delivery stream | S3 Tables destination, 60s buffer, `request_id` upsert key |
+| Firehose delivery stream | S3 Tables destination (append), 60s buffer |
 | Athena workgroup | For `compute_cost` and ad-hoc queries |
-| Lambda | `parse_log` (L1), `compute_cost` (L2), `aggregate_stats`, `sync_pricing`, custom-resource handlers; 1-month log retention |
-| EventBridge rules | S3 trigger, L2 schedule, daily & monthly rollup, weekly pricing sync |
-| SQS DLQ | Failed `parse_log` invocations and events |
-| SNS topic + CloudWatch alarms | Lambda errors, DLQ depth, Firehose failed rows / freshness, L2 checkpoint lag, unpriced usage |
+| Lambda | `parse_log` (L1), `compute_cost` (L2), `sync_pricing`, custom-resource handlers; 1-month log retention |
+| EventBridge rules | S3 trigger, L2 incremental and hourly settle, weekly pricing sync |
+| SQS DLQ | Failed `parse_log` invocations and events; failed `compute_cost` runs (they resume on their own; purge after review) |
+| SNS topic + CloudWatch alarms | Lambda errors, DLQ depth, Firehose failed rows / freshness, L2 checkpoint lag, settle lag, unpriced usage |
 | IAM Roles | Firehose delivery role, Lambda execution roles, `SpokeWriteRole` (Firehose put only, trusted for the spoke `parse_log` role) |
 | WebUI | VPC (created unless `webui.vpc_id` is set; no NAT), internal ALB with a Lambda target, optional CloudFront distribution (VPC origin), Cognito user pool (unless an existing one is given) and app client |
 
@@ -196,9 +200,13 @@ After adding or correcting a price (Pricing page or LiteLLM sync), recompute the
 
 ```bash
 scripts/rebuild_costs.sh 2026-07-01 2026-07-31   # UTC dates, inclusive
+scripts/rebuild_costs.sh --all --dry-run         # every day Iceberg fully covers; prints the changes
+scripts/rebuild_costs.sh --all
 ```
 
-The most recent ~25 hours are still owned by the incremental L2 run and are skipped; run the script again later to cover them.
+The script runs inside the compute-cost Lambda month by month. `--dry-run` lists per-day invocation changes and flags drops. Today is left to the incremental and settle runs.
+
+To check that DynamoDB matches Iceberg (invocations, tokens, latency, cost, TPOT, rollup invariants), run the read-only `AWS_PROFILE=... uv run python scripts/reconcile.py [START END]`.
 
 ## WebUI
 
@@ -243,19 +251,19 @@ uv run pytest
 
 | Service | Pricing | Notes |
 |---------|---------|-------|
-| Lambda | $0.20/M requests (ARM/Graviton) | L1 parse_log + L2 compute_cost + rollups |
-| Firehose | $0.029/GB ingested + small per-record fee | Buffered then Iceberg upsert |
+| Lambda | $0.20/M requests (ARM/Graviton) | L1 parse_log + L2 compute_cost |
+| Firehose | $0.029/GB ingested + small per-record fee | Buffered then appended to Iceberg |
 | S3 Tables (Iceberg) | ~$0.023/GB + $0.20/M requests | Partitioned by `account_id / day(ts)` |
 | DynamoDB | Pay-per-request | Now only L2 aggregates write (≈13× fewer writes than V2 since L1 skips DDB) |
 | Athena | $5/TB scanned | L2 scans one partition per run; ad-hoc queries extra |
 | S3 (raw logs) | ~$0.023/GB/month | Auto-transitions to IA after 90 days |
 
 **Monthly estimate** (1M Bedrock invocations, Anthropic models with caching):
-- Lambda: ~$0.20 (L1) + ~$0.05 (L2, every 5 min)
-- KMS: $1 per key (one per account) + requests; CloudWatch alarms: ~$0.10 each (9 hub, 2 per spoke)
+- Lambda: ~$0.20 (L1) + ~$0.30 (L2: every 5 min plus hourly settle, 1 GB)
+- KMS: $1 per key (one per account) + requests; CloudWatch alarms: ~$0.10 each (10 hub, 2 per spoke)
 - Firehose + S3 Tables: ~$1 (few hundred MB of Iceberg data)
-- DynamoDB: ~$0.30 (L2 TransactWriteItems, ~3 items/event)
-- Athena: ~$0.10 (L2 scans small hourly partitions; ad-hoc extra)
+- DynamoDB: ~$0.30 (L2 writes only rows whose values changed)
+- Athena: ~$0.30 (L2 scans recent day partitions; the daily 90-day count check reads only key columns; ad-hoc extra)
 - S3 (raw logs): ~$1
 - WebUI: ALB ~$16–18 + LCU; Lambda, CloudFront and Cognito well under $1 at dashboard traffic
 - **Total: ~$24/month** for one hub and one spoke

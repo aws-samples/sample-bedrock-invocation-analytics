@@ -40,7 +40,6 @@ Amazon Bedrock 实时分析 — 监控多账户的 Token 用量、成本和性�
 │   └── lambda/
 │       ├── parse_log.py      # L1：S3 事件 → 规整 JSON → Firehose
 │       ├── compute_cost.py   # L2：Athena (Iceberg) → 定价 → DynamoDB
-│       ├── aggregate_stats.py # 汇总：HOURLY → DAILY → MONTHLY
 │       └── sync_pricing.py   # 每周从 LiteLLM 同步定价
 │   ├── common.py             # 共用构件（日志桶、Lambda、告警）
 │   └── custom_resources/     # Bedrock 日志、Lake Formation 管理员、IAM 等待
@@ -51,6 +50,7 @@ Amazon Bedrock 实时分析 — 监控多账户的 Token 用量、成本和性�
 ├── scripts/
 │   ├── seed_pricing.py       # 从 LiteLLM 导入定价
 │   ├── rebuild_costs.sh      # 基于 Iceberg 重算历史成本
+│   ├── reconcile.py          # 只读对账：DynamoDB 汇总 vs Iceberg
 │   └── build_webui.sh        # 构建 SPA 和 WebUI Lambda 部署包
 ├── tests/                    # 单元测试（uv run pytest）
 ├── config.example.yaml       # 多账号部署配置
@@ -76,7 +76,7 @@ Amazon Bedrock 实时分析 — 监控多账户的 Token 用量、成本和性�
 │                                                           │                  │
 │                                  ┌────────────────────────┤                  │
 │                                  │                        │                  │
-│                                  ▼ 每 5 分钟              │                  │
+│                                  ▼ 每 5 分钟 + 每小时     │                  │
 │                    Lambda: compute_cost                   │                  │
 │                    [L2：定价 + 聚合]                      │                  │
 │                          │                                │                  │
@@ -89,7 +89,6 @@ Amazon Bedrock 实时分析 — 监控多账户的 Token 用量、成本和性�
 │     （API + SPA）        ▲ 内网                         Cognito 登录         │
 │                                                                              │
 │  DynamoDB: model-pricing ◄── Lambda: sync_pricing（每周）                     │
-│  Lambda: aggregate_stats（HOURLY → DAILY → MONTHLY,每日/每月触发）           │
 │  IAM Role: SpokeWriteRole（供 spoke assume 后写入 Hub Firehose）              │
 └──────────────────────────────────────────────────────────────────────────────┘
        ▲ assume role + 跨账号 firehose:PutRecord
@@ -107,9 +106,13 @@ Amazon Bedrock 实时分析 — 监控多账户的 Token 用量、成本和性�
 
 1. **Bedrock 日志** 落到各账号自己的 S3 桶（Bedrock 要求日志汇流桶与调用在同账号同 Region）。
 2. **L1 `parse_log`**（每个账号一个 Lambda,由 S3 事件触发）把每条记录规整成扁平 JSON 事件（account、region、model、caller、token 数、缓存拆分、延迟、错误码）,通过 `PutRecordBatch` 投递到 Hub 的 Firehose。Spoke Lambda 通过跨账号角色访问。
-3. **Firehose → S3 Tables**：Firehose 缓冲约 60 秒后,以 `request_id` 为唯一键 upsert 到 Iceberg 表 `bedrock_analytics.usage_events` —— 这是每次 Bedrock 调用的**真实数据源**,同时可直接通过 Athena 即席查询做深度分析。
-4. **L2 `compute_cost`**（仅 Hub,EventBridge 每 `cost_agg_interval_min` 分钟触发）通过 Athena 读取自 checkpoint 以来摄入的 Iceberg 事件,在 DynamoDB 中查询时间感知定价,计算成本（拆分 5min 与 1h prompt cache）,并以 `TransactWriteItems` + 去重守护的方式聚合到 DynamoDB。运行失败时 checkpoint 不前进,下次运行会重试。解析和计算分离意味着修正定价后只需对 Iceberg 运行 `scripts/rebuild_costs.sh`,无需重新解析原始 S3。
-5. **`aggregate_stats`** 按计划把 hourly → daily → monthly 汇总,并重算最近几天以纳入迟到事件。**`sync_pricing`** 每周从 [LiteLLM](https://github.com/BerriAI/litellm) 拉最新模型定价。
+3. **Firehose → S3 Tables**：Firehose 缓冲约 60 秒后追加写入 Iceberg 表 `bedrock_analytics.usage_events`，这是每次 Bedrock 调用的**真实数据源**，也可直接用 Athena 即席查询。该表只追加，投递重试可能产生重复行，所有读取方都按 `request_id` 去重。
+4. **L2 `compute_cost`**（仅 Hub）从不做累加。每次运行用一条 Athena 查询重算整段时间（按 `request_id` 去重、时间感知定价、拆分 5min 与 1h prompt cache），并整体替换 DynamoDB 中该时段的行，所以重跑或时间重叠都不会出错：
+   - **incremental**（每 `cost_agg_interval_min` 分钟）：重算自 checkpoint 以来有新事件的小时，以及当前和上一小时。失败时 checkpoint 不前进。
+   - **settle**（每小时）：重算最近 2 个完整日、收到迟到事件的日期，以及与 Iceberg 条数不一致的日期（每天检查一次近 90 天）；写 DAILY，月份结束后写 MONTHLY。`META/SETTLED#<account>#<region>` 记录已结算到哪一天，Dashboard 在此之前读 DAILY，之后读 HOURLY。
+   - **rebuild**（`scripts/rebuild_costs.sh`）：对任意区间做同样的重算，用于重新定价。
+   三者由租约锁互斥。解析和计算分离，修正定价只需基于 Iceberg 重算，无需重新解析原始 S3。
+5. **`sync_pricing`** 每周从 [LiteLLM](https://github.com/BerriAI/litellm) 拉最新模型定价。
 6. **WebUI**：一个 Lambda 同时提供 React SPA 和 JSON API，部署在内部 ALB 后面（可选通过 VPC origin 在前面加 CloudFront）。它从 DynamoDB 读取数据（亚秒级响应），作为 serving 缓存层，每次 API 调用都校验 Cognito access token。Header 显示基于 L2 checkpoint 的 *"Data up to X"*,让用户能区分真实数据新鲜度和 UI 刷新时间。
 
 ## 前置条件
@@ -158,15 +161,15 @@ uv sync
 | S3 ops 存储桶 | Athena 结果（7 天过期）和 Firehose 错误备份（90 天过期） |
 | KMS 密钥 | 原始日志桶加密和告警主题 |
 | Custom Resource | Bedrock 调用日志（与现有配置合并,不覆盖其他目标）;Lake Formation 管理员（追加 CDK 部署角色,不替换管理员列表） |
-| DynamoDB × 2 | `usage-stats`（serving 层 + DEDUP + META）和 `model-pricing`（时间感知）;开启 PITR 与删除保护 |
+| DynamoDB × 2 | `usage-stats`（HOURLY / DAILY / MONTHLY 汇总 + META）和 `model-pricing`（时间感知）;开启 PITR 与删除保护 |
 | S3 Tables bucket + namespace + Iceberg 表 | `usage_events` — 真实数据源,通过 Athena 可查 |
 | Glue Data Catalog（联邦） | `s3tablescatalog`,指向 S3 Tables bucket |
-| Firehose 投递流 | S3 Tables 目标,60s 缓冲,以 `request_id` 为 upsert 键 |
+| Firehose 投递流 | S3 Tables 目标（追加写入）,60s 缓冲 |
 | Athena workgroup | 供 `compute_cost` 和即席查询使用 |
-| Lambda | `parse_log`（L1）、`compute_cost`（L2）、`aggregate_stats`、`sync_pricing`、Custom Resource 处理器;日志保留 1 个月 |
-| EventBridge 规则 | S3 触发器、L2 调度、每日与每月汇总、每周定价同步 |
-| SQS DLQ | `parse_log` 失败的调用和事件 |
-| SNS 主题 + CloudWatch 告警 | Lambda 错误、DLQ 深度、Firehose 失败行/新鲜度、L2 checkpoint 延迟、未定价调用 |
+| Lambda | `parse_log`（L1）、`compute_cost`（L2）、`sync_pricing`、Custom Resource 处理器;日志保留 1 个月 |
+| EventBridge 规则 | S3 触发器、L2 incremental 与每小时 settle、每周定价同步 |
+| SQS DLQ | `parse_log` 失败的调用和事件；`compute_cost` 失败的运行（会自行续跑，检查后清空） |
+| SNS 主题 + CloudWatch 告警 | Lambda 错误、DLQ 深度、Firehose 失败行/新鲜度、L2 checkpoint 延迟、settle 延迟、未定价调用 |
 | IAM Roles | Firehose 投递角色、Lambda 执行角色、`SpokeWriteRole`（仅 Firehose 写入,只信任 spoke 的 `parse_log` 角色） |
 | WebUI | VPC（未指定 `webui.vpc_id` 时新建，不建 NAT）、带 Lambda 目标的内部 ALB、可选 CloudFront 分发（VPC origin）、Cognito user pool（未指定已有 pool 时新建）和 app client |
 
@@ -195,10 +198,14 @@ AWS_DEFAULT_REGION=us-west-2 python3 scripts/seed_pricing.py \
 新增或修正价格后（定价页面或 LiteLLM 同步）,基于 Iceberg 事件表重算受影响的日期：
 
 ```bash
-scripts/rebuild_costs.sh 2026-07-01 2026-07-31   # UTC 日期,含首尾
+scripts/rebuild_costs.sh 2026-07-01 2026-07-31   # UTC 日期，含首尾
+scripts/rebuild_costs.sh --all --dry-run         # Iceberg 完整覆盖的所有日期；只打印变化
+scripts/rebuild_costs.sh --all
 ```
 
-最近约 25 小时仍由增量 L2 负责,会被跳过;之后再运行一次即可覆盖。
+脚本在 compute-cost Lambda 内按月执行。`--dry-run` 列出每天调用次数的变化并标出下降项。当天由 incremental 与 settle 负责。
+
+核对 DynamoDB 与 Iceberg 是否一致（调用次数、token、延迟、成本、TPOT、汇总不变式）：只读运行 `AWS_PROFILE=... uv run python scripts/reconcile.py [START END]`。
 
 ## WebUI
 
@@ -244,19 +251,19 @@ uv run pytest
 | 服务 | 定价 | 说明 |
 |------|------|------|
 | Lambda | $0.20/百万次请求（ARM/Graviton） | L1 parse_log + L2 compute_cost + 汇总 |
-| Firehose | $0.029/GB 摄入 + 少量每记录费用 | 缓冲后 upsert 到 Iceberg |
+| Firehose | $0.029/GB 摄入 + 少量每记录费用 | 缓冲后追加写入 Iceberg |
 | S3 Tables (Iceberg) | 约 $0.023/GB + $0.20/百万次请求 | 按 `account_id / day(ts)` 分区 |
 | DynamoDB | 按请求付费 | 只有 L2 聚合写入（较 V2 写入次数减少约 13 倍,L1 不再写 DDB） |
 | Athena | $5/TB 扫描 | L2 每次扫描一个分区;即席查询另计 |
 | S3（原始日志） | 约 $0.023/GB/月 | 90 天后自动转为低频存储 |
 
 **月度估算**（100 万次 Bedrock 调用,Anthropic 模型含缓存）：
-- Lambda：约 $0.20（L1）+ 约 $0.05（L2,每 5 分钟）
+- Lambda：约 $0.20（L1）+ 约 $0.30（L2：每 5 分钟加每小时 settle，1 GB）
 - Firehose + S3 Tables：约 $1（几百 MB Iceberg 数据）
-- DynamoDB：约 $0.30（L2 TransactWriteItems,每事件约 3 条 items）
-- Athena：约 $0.10（L2 扫描小时级小分区;即席查询另计）
+- DynamoDB：约 $0.30（L2 只写值有变化的行）
+- Athena：约 $0.30（L2 扫描近期日分区；每天一次的 90 天条数检查只读键列；即席查询另计）
 - S3（原始日志）：约 $1
-- KMS：每个密钥 $1（每账号一个）+ 请求费;CloudWatch 告警：每个约 $0.10（hub 9 个,每个 spoke 2 个）
+- KMS：每个密钥 $1（每账号一个）+ 请求费;CloudWatch 告警：每个约 $0.10（hub 10 个,每个 spoke 2 个）
 - WebUI：ALB 约 $16–18 + LCU；Lambda、CloudFront、Cognito 在看板的访问量下都远低于 $1
 - **合计：约 $24/月**（一个 hub + 一个 spoke）
 
