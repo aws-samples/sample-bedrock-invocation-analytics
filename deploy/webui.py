@@ -29,6 +29,10 @@ import common
 LAMBDA_PACKAGE = Path(__file__).resolve().parent.parent / "build" / "webui-lambda"
 DEFAULT_ADMIN_GROUP = "bedrock-analytics-admin"
 ADMIN_GROUP_DESCRIPTION = "Bedrock Invocation Analytics: edit pricing"
+# Tokens from USER_PASSWORD_AUTH may call UpdateUserAttributes, and Cognito treats an unset or empty WriteAttributes
+# as "all mutable attributes" (custom ones included). The WebUI writes none; Cognito requires required attributes
+# (email) to stay writable, so that is the narrowest list it accepts.
+CLIENT_WRITE_ATTRIBUTES = ["email"]
 
 
 @dataclass
@@ -137,6 +141,7 @@ class WebUi(Construct):
             user_pool_client_name=f"{Stack.of(self).stack_name}-webui",
             generate_secret=False,
             auth_flows=cognito.AuthFlow(user_password=True, user_srp=True),
+            write_attributes=cognito.ClientAttributes().with_standard_attributes(email=True),
             disable_o_auth=True,
             prevent_user_existence_errors=True,
             access_token_validity=Duration.hours(1),
@@ -175,6 +180,7 @@ class WebUi(Construct):
             "ExplicitAuthFlows": ["ALLOW_USER_PASSWORD_AUTH", "ALLOW_USER_SRP_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
             "PreventUserExistenceErrors": "ENABLED",
             "EnableTokenRevocation": True,
+            "WriteAttributes": CLIENT_WRITE_ATTRIBUTES,
             "AccessTokenValidity": 60, "IdTokenValidity": 60, "RefreshTokenValidity": 720,
             "TokenValidityUnits": {"AccessToken": "minutes", "IdToken": "minutes", "RefreshToken": "minutes"},
         }
