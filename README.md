@@ -19,8 +19,10 @@ Real-time analytics for Amazon Bedrock — monitor token usage, costs, and perfo
 - CloudWatch alarms (SNS) on Lambda errors, DLQs, Firehose delivery, L2 lag and unpriced usage
 - Pricing settings page: view/edit model pricing with history, weekly auto-sync from LiteLLM
 - Ad-hoc Athena queries on the raw Iceberg event log for deep investigation
-- Multi-account, multi-region support (sidebar selector, friendly account names from `config.yaml`)
-- Login authentication (configurable via `config.yaml`)
+- Multi-account, multi-region support: account and region filters in a collapsible side panel (collapse it to hide them for screenshots), friendly account names from `config.yaml`
+- Calendar presets (today, this week/month/quarter/year), rolling windows and custom date ranges, in local time or UTC
+- Cognito sign-in (a new user pool or an existing one, in any region of the account); members of an admin group edit pricing, everyone else is read-only
+- Internal ALB by default, optional CloudFront in front of it for HTTPS access from anywhere
 - Responsive layout (desktop & mobile)
 
 **Screenshot**
@@ -42,19 +44,17 @@ Real-time analytics for Amazon Bedrock — monitor token usage, costs, and perfo
 │       └── sync_pricing.py   # Weekly pricing sync from LiteLLM
 │   ├── common.py             # Shared constructs (log bucket, Lambda, alarms)
 │   └── custom_resources/     # Bedrock logging, Lake Formation admin, IAM wait
-├── webui/
-│   ├── main.py               # Entry point (ui.run)
-│   ├── dashboard.py          # Dashboard page
-│   ├── pricing.py            # Pricing settings page
-│   ├── data.py               # DynamoDB data access
-│   └── auth.py               # Login helpers
+│   └── webui.py              # WebUI: VPC, internal ALB, Lambda target, CloudFront, Cognito
+├── webui/                    # React SPA (Vite, TypeScript, Cloudscape, ECharts)
+│   ├── src/                  # Pages, charts, sign-in, filters
+│   └── api/                  # Lambda behind the ALB: JSON API + SPA files
 ├── scripts/
 │   ├── seed_pricing.py       # Seed pricing from LiteLLM
-│   └── rebuild_costs.sh      # Reprice past usage from Iceberg
+│   ├── rebuild_costs.sh      # Reprice past usage from Iceberg
+│   └── build_webui.sh        # Build the SPA and the WebUI Lambda package
 ├── tests/                    # Unit tests (uv run pytest)
 ├── config.example.yaml       # Multi-account deployment config
 ├── deploy.sh                 # CDK deploy script (hub/spoke/all/destroy)
-├── start-webui.sh            # WebUI launch script (reads .env.deploy)
 └── pyproject.toml            # Dependencies (managed by uv)
 ```
 
@@ -85,7 +85,8 @@ Two-stage pipeline: **L1** (parse) turns every Bedrock call into a structured ev
 │                    (serving layer for UI)         (via Glue federation)      │
 │                          │                                                   │
 │                          ▼                                                   │
-│                         WebUI                                                │
+│     WebUI Lambda ◄── internal ALB ◄── (optional) CloudFront ◄── browser      │
+│     (API + SPA)          ▲ intranet                    Cognito sign-in       │
 │                                                                              │
 │  DynamoDB: model-pricing ◄── Lambda: sync_pricing (weekly)                   │
 │  Lambda: aggregate_stats (HOURLY → DAILY → MONTHLY, daily/monthly)           │
@@ -109,12 +110,13 @@ Two-stage pipeline: **L1** (parse) turns every Bedrock call into a structured ev
 3. **Firehose → S3 Tables**: Firehose buffers ~60s then upserts into the Iceberg table `bedrock_analytics.usage_events`, using `request_id` as the unique key — this is the **source of truth** for every Bedrock call, also directly queryable via Athena for ad-hoc investigation.
 4. **L2 `compute_cost`** (hub only, EventBridge every `cost_agg_interval_min`) reads events ingested since its checkpoint from Iceberg via Athena, looks up time-aware pricing in DynamoDB, computes cost (splitting 5m vs 1h prompt cache), and aggregates into DynamoDB via `TransactWriteItems` with a dedup guard. A failed run keeps the checkpoint, so the next run retries. Separating compute from parse means a pricing fix only needs `scripts/rebuild_costs.sh` over Iceberg — no re-parsing raw S3.
 5. **`aggregate_stats`** rolls hourly → daily → monthly on schedule, recomputing recent days so late events are included. **`sync_pricing`** pulls the latest model prices from [LiteLLM](https://github.com/BerriAI/litellm) weekly.
-6. **WebUI** reads DynamoDB (sub-second) as a serving-layer cache. The header shows *"Data up to X"* based on L2's checkpoint, so users can tell real-time data freshness apart from UI refresh time.
+6. **WebUI**: a React SPA and a JSON API served by one Lambda behind an internal ALB (optionally fronted by CloudFront through a VPC origin). It reads DynamoDB (sub-second) as a serving-layer cache and checks Cognito access tokens on every API call. The header shows *"Data up to X"* based on L2's checkpoint, so users can tell real-time data freshness apart from UI refresh time.
 
 ## Prerequisites
 
 - [AWS CDK CLI](https://docs.aws.amazon.com/cdk/v2/guide/getting-started.html) (`npm install -g aws-cdk`)
 - [uv](https://docs.astral.sh/uv/) (Python package manager)
+- [Node.js](https://nodejs.org/) 22 or 24 (builds the WebUI)
 - AWS credentials configured (`aws configure` or `~/.aws/credentials`)
 
 ## Deploy
@@ -166,6 +168,7 @@ uv sync
 | SQS DLQ | Failed `parse_log` invocations and events |
 | SNS topic + CloudWatch alarms | Lambda errors, DLQ depth, Firehose failed rows / freshness, L2 checkpoint lag, unpriced usage |
 | IAM Roles | Firehose delivery role, Lambda execution roles, `SpokeWriteRole` (Firehose put only, trusted for the spoke `parse_log` role) |
+| WebUI | VPC (created unless `webui.vpc_id` is set; no NAT), internal ALB with a Lambda target, optional CloudFront distribution (VPC origin), Cognito user pool (unless an existing one is given) and app client |
 
 **Spoke accounts:**
 
@@ -197,13 +200,30 @@ scripts/rebuild_costs.sh 2026-07-01 2026-07-31   # UTC dates, inclusive
 
 The most recent ~25 hours are still owned by the incremental L2 run and are skipped; run the script again later to cover them.
 
-## Start WebUI
+## WebUI
+
+`./deploy.sh hub` builds the SPA and deploys it with the hub stack. Choose how users reach it in the `webui` section of `config.yaml`:
+
+| Setting | Effect |
+|---|---|
+| `cloudfront: true` | Adds a CloudFront distribution in front of the internal ALB (VPC origin). Open the `WebUiUrl` output (`https://<id>.cloudfront.net`). The ALB itself is never internet-facing. |
+| `allowed_cidrs` | Intranet ranges (VPN, office, peered VPCs) allowed to reach the internal ALB directly at `WebUiAlbDnsName`. |
+| `certificate_arn` | ACM certificate for HTTPS on the ALB (port 443). Without it, direct ALB access is plaintext HTTP on port 80 and deploy prints a warning. |
+| `vpc_id`, `subnet_ids` | Use your VPC and two or more private subnets in different AZs. With CloudFront the VPC needs an internet gateway. Empty = a minimal VPC is created. |
+| `cognito_user_pool_id` | Reuse an existing pool in the same account (any region); the stack only adds an app client. Empty = a pool is created. |
+| `admin_group` | Group whose members can edit pricing. Every other signed-in user is read-only. Empty = the stack creates `bedrock-analytics-admin`. |
+| `initial_admin_email` | Created pool only: creates the first admin and emails a temporary password. |
+
+Either `cloudfront: true` or `allowed_cidrs` is required. WAF isn't managed by the stack; attach a web ACL to the ALB or the distribution if you need one.
+
+Sign in with a username or email. The SPA uses `USER_PASSWORD_AUTH` (over TLS) so an existing pool's user-migration trigger keeps working.
+
+Local development against a deployed stack:
 
 ```bash
-./start-webui.sh
+cd webui && npm ci
+WEBUI_URL=https://<id>.cloudfront.net npm run dev   # proxies /api and /config.json
 ```
-
-Open http://localhost:8060 in your browser. The server listens on 127.0.0.1 only; to reach it from another machine use SSH or SSM port forwarding, or set `WEBUI_HOST` behind a TLS reverse proxy.
 
 ## Tests
 
@@ -237,7 +257,8 @@ uv run pytest
 - DynamoDB: ~$0.30 (L2 TransactWriteItems, ~3 items/event)
 - Athena: ~$0.10 (L2 scans small hourly partitions; ad-hoc extra)
 - S3 (raw logs): ~$1
-- **Total: ~$6/month** for one hub and one spoke
+- WebUI: ALB ~$16–18 + LCU; Lambda, CloudFront and Cognito well under $1 at dashboard traffic
+- **Total: ~$24/month** for one hub and one spoke
 
 Costs scale sub-linearly with invocations — Firehose buffering amortizes per-record overhead, and Iceberg partition pruning keeps Athena scans small as history grows.
 

@@ -19,8 +19,10 @@ Amazon Bedrock 实时分析 — 监控多账户的 Token 用量、成本和性�
 - CloudWatch 告警（SNS）：Lambda 错误、DLQ、Firehose 投递、L2 延迟、未定价调用
 - 定价设置页面：查看/编辑模型定价及历史，每周从 LiteLLM 自动同步
 - Athena 即席查询 Iceberg 事件表，支持深度排查
-- 多账户、多区域支持（侧栏选择器,从 `config.yaml` 读取友好账号名）
-- 登录认证（通过 `config.yaml` 配置）
+- 多账户、多区域支持：账号和区域筛选放在可折叠侧栏里（截图时收起即可隐藏），友好账号名来自 `config.yaml`
+- 日历预设（今天、本周/本月/本季度/本年）、滚动窗口和自定义日期范围，可按本地时区或 UTC 显示
+- Cognito 登录（新建 user pool，或沿用本账号任意区域的已有 pool）；管理员组成员可编辑定价，其他人只读
+- 默认部署内部 ALB，可选在前面加 CloudFront，从任何地方通过 HTTPS 访问
 - 响应式布局（桌面和移动端）
 
 **截图**
@@ -42,19 +44,17 @@ Amazon Bedrock 实时分析 — 监控多账户的 Token 用量、成本和性�
 │       └── sync_pricing.py   # 每周从 LiteLLM 同步定价
 │   ├── common.py             # 共用构件（日志桶、Lambda、告警）
 │   └── custom_resources/     # Bedrock 日志、Lake Formation 管理员、IAM 等待
-├── webui/
-│   ├── main.py               # 入口（ui.run）
-│   ├── dashboard.py          # 仪表盘页面
-│   ├── pricing.py            # 定价设置页面
-│   ├── data.py               # DynamoDB 数据访问层
-│   └── auth.py               # 登录辅助
+│   └── webui.py              # WebUI：VPC、内部 ALB、Lambda 目标、CloudFront、Cognito
+├── webui/                    # React SPA（Vite、TypeScript、Cloudscape、ECharts）
+│   ├── src/                  # 页面、图表、登录、筛选
+│   └── api/                  # ALB 后面的 Lambda：JSON API + SPA 静态文件
 ├── scripts/
 │   ├── seed_pricing.py       # 从 LiteLLM 导入定价
-│   └── rebuild_costs.sh      # 基于 Iceberg 重算历史成本
+│   ├── rebuild_costs.sh      # 基于 Iceberg 重算历史成本
+│   └── build_webui.sh        # 构建 SPA 和 WebUI Lambda 部署包
 ├── tests/                    # 单元测试（uv run pytest）
 ├── config.example.yaml       # 多账号部署配置
 ├── deploy.sh                 # CDK 部署脚本（hub/spoke/all/destroy）
-├── start-webui.sh            # WebUI 启动脚本（读取 .env.deploy）
 └── pyproject.toml            # 依赖管理（uv）
 ```
 
@@ -85,7 +85,8 @@ Amazon Bedrock 实时分析 — 监控多账户的 Token 用量、成本和性�
 │                    （UI 的 serving 缓存层）       （通过 Glue 联邦）          │
 │                          │                                                   │
 │                          ▼                                                   │
-│                         WebUI                                                │
+│     WebUI Lambda ◄── 内部 ALB ◄── （可选）CloudFront ◄── 浏览器              │
+│     （API + SPA）        ▲ 内网                         Cognito 登录         │
 │                                                                              │
 │  DynamoDB: model-pricing ◄── Lambda: sync_pricing（每周）                     │
 │  Lambda: aggregate_stats（HOURLY → DAILY → MONTHLY,每日/每月触发）           │
@@ -109,12 +110,13 @@ Amazon Bedrock 实时分析 — 监控多账户的 Token 用量、成本和性�
 3. **Firehose → S3 Tables**：Firehose 缓冲约 60 秒后,以 `request_id` 为唯一键 upsert 到 Iceberg 表 `bedrock_analytics.usage_events` —— 这是每次 Bedrock 调用的**真实数据源**,同时可直接通过 Athena 即席查询做深度分析。
 4. **L2 `compute_cost`**（仅 Hub,EventBridge 每 `cost_agg_interval_min` 分钟触发）通过 Athena 读取自 checkpoint 以来摄入的 Iceberg 事件,在 DynamoDB 中查询时间感知定价,计算成本（拆分 5min 与 1h prompt cache）,并以 `TransactWriteItems` + 去重守护的方式聚合到 DynamoDB。运行失败时 checkpoint 不前进,下次运行会重试。解析和计算分离意味着修正定价后只需对 Iceberg 运行 `scripts/rebuild_costs.sh`,无需重新解析原始 S3。
 5. **`aggregate_stats`** 按计划把 hourly → daily → monthly 汇总,并重算最近几天以纳入迟到事件。**`sync_pricing`** 每周从 [LiteLLM](https://github.com/BerriAI/litellm) 拉最新模型定价。
-6. **WebUI** 从 DynamoDB 读取（亚秒级响应）,作为 serving 缓存层。Header 显示基于 L2 checkpoint 的 *"Data up to X"*,让用户能区分真实数据新鲜度和 UI 刷新时间。
+6. **WebUI**：一个 Lambda 同时提供 React SPA 和 JSON API，部署在内部 ALB 后面（可选通过 VPC origin 在前面加 CloudFront）。它从 DynamoDB 读取数据（亚秒级响应），作为 serving 缓存层，每次 API 调用都校验 Cognito access token。Header 显示基于 L2 checkpoint 的 *"Data up to X"*,让用户能区分真实数据新鲜度和 UI 刷新时间。
 
 ## 前置条件
 
 - [AWS CDK CLI](https://docs.aws.amazon.com/cdk/v2/guide/getting-started.html)（`npm install -g aws-cdk`）
 - [uv](https://docs.astral.sh/uv/)（Python 包管理器）
+- [Node.js](https://nodejs.org/) 22 或 24（构建 WebUI）
 - 已配置 AWS 凭证（`aws configure` 或 `~/.aws/credentials`）
 
 ## 部署
@@ -166,6 +168,7 @@ uv sync
 | SQS DLQ | `parse_log` 失败的调用和事件 |
 | SNS 主题 + CloudWatch 告警 | Lambda 错误、DLQ 深度、Firehose 失败行/新鲜度、L2 checkpoint 延迟、未定价调用 |
 | IAM Roles | Firehose 投递角色、Lambda 执行角色、`SpokeWriteRole`（仅 Firehose 写入,只信任 spoke 的 `parse_log` 角色） |
+| WebUI | VPC（未指定 `webui.vpc_id` 时新建，不建 NAT）、带 Lambda 目标的内部 ALB、可选 CloudFront 分发（VPC origin）、Cognito user pool（未指定已有 pool 时新建）和 app client |
 
 **Spoke 账号：**
 
@@ -197,13 +200,30 @@ scripts/rebuild_costs.sh 2026-07-01 2026-07-31   # UTC 日期,含首尾
 
 最近约 25 小时仍由增量 L2 负责,会被跳过;之后再运行一次即可覆盖。
 
-## 启动 WebUI
+## WebUI
+
+`./deploy.sh hub` 会构建 SPA 并随 hub 栈一起部署。用户的访问方式在 `config.yaml` 的 `webui` 段里配置：
+
+| 配置 | 作用 |
+|---|---|
+| `cloudfront: true` | 在内部 ALB 前加一个 CloudFront 分发（VPC origin）。访问输出里的 `WebUiUrl`（`https://<id>.cloudfront.net`）。ALB 本身始终不暴露到公网。 |
+| `allowed_cidrs` | 允许直接访问内部 ALB（`WebUiAlbDnsName`）的内网网段（VPN、办公网、对等 VPC）。 |
+| `certificate_arn` | ALB 的 HTTPS 证书（443 端口）。不填时直连 ALB 走明文 HTTP 80 端口，部署时会给出警告。 |
+| `vpc_id`、`subnet_ids` | 使用已有 VPC，以及至少两个不同可用区的私有子网。开 CloudFront 时 VPC 需要有 Internet Gateway。留空则新建一个最小 VPC。 |
+| `cognito_user_pool_id` | 沿用本账号已有的 pool（任意区域），栈只在其中新增一个 app client。留空则新建 pool。 |
+| `admin_group` | 可编辑定价的用户组，其他已登录用户只读。留空则由栈创建 `bedrock-analytics-admin`。 |
+| `initial_admin_email` | 仅新建 pool 时生效：创建首个管理员，并把临时密码发到这个邮箱。 |
+
+`cloudfront: true` 和 `allowed_cidrs` 至少要配一个。WAF 不由本项目管理，需要的话自行给 ALB 或 CloudFront 分发挂 Web ACL。
+
+可以用用户名或邮箱登录。SPA 使用 `USER_PASSWORD_AUTH`（经 TLS 传输），这样沿用的 pool 如果挂了用户迁移触发器，也能正常工作。
+
+本地开发时连接已部署的栈：
 
 ```bash
-./start-webui.sh
+cd webui && npm ci
+WEBUI_URL=https://<id>.cloudfront.net npm run dev   # 代理 /api 和 /config.json
 ```
-
-浏览器打开 http://localhost:8060。服务只监听 127.0.0.1;如需从其他机器访问,请使用 SSH 或 SSM 端口转发,或在 TLS 反向代理后设置 `WEBUI_HOST`。
 
 ## 测试
 
@@ -237,7 +257,8 @@ uv run pytest
 - Athena：约 $0.10（L2 扫描小时级小分区;即席查询另计）
 - S3（原始日志）：约 $1
 - KMS：每个密钥 $1（每账号一个）+ 请求费;CloudWatch 告警：每个约 $0.10（hub 9 个,每个 spoke 2 个）
-- **合计：约 $6/月**（一个 hub + 一个 spoke）
+- WebUI：ALB 约 $16–18 + LCU；Lambda、CloudFront、Cognito 在看板的访问量下都远低于 $1
+- **合计：约 $24/月**（一个 hub + 一个 spoke）
 
 成本对调用次数是亚线性增长 —— Firehose 缓冲摊薄每记录开销,Iceberg 分区裁剪随历史增长仍保持较小扫描量。
 
