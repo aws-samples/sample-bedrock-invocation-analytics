@@ -136,6 +136,10 @@ def main():
                 expected[key][dim].update(values)
     problems = 0
     pks = {pk for pk, _ in expected}
+    first_full = {}
+    for r in athena(workgroup, f"SELECT account_id || '#' || region AS pk, CAST(min(ts) AS VARCHAR) AS t FROM {table_ref} GROUP BY 1"):
+        t = datetime.fromisoformat(r["t"][:19].replace(" ", "T"))
+        first_full[r["pk"]] = t.date() if t.time() == datetime.min.time() else t.date() + timedelta(days=1)
     for pk in sorted(pks):
         settled = table.get_item(Key={"PK": "META", "SK": f"SETTLED#{pk}"}).get("Item", {}).get("day")
         if not settled:
@@ -143,7 +147,7 @@ def main():
             print(f"{pk[-14:]} has no SETTLED watermark (settle has not run for it)")
             continue
         last = min(end, date.fromisoformat(settled))
-        d = start
+        d = max(start, first_full[pk])  # an earlier, partly covered day was recorded before Iceberg existed
         while d <= last:
             got = {i["SK"].split("#", 2)[2]: i for i in query_all(table, Key("PK").eq(pk) & Key("SK").begins_with(f"DAILY#{d.isoformat()}#"))}
             want = expected.get((pk, d.isoformat()), {})
