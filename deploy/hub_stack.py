@@ -19,6 +19,7 @@ from aws_cdk import (
     aws_glue as glue,
     aws_iam as iam,
     aws_kinesisfirehose as firehose,
+    aws_lambda_destinations as lambda_destinations,
     aws_logs as logs,
     aws_s3 as s3,
     aws_s3tables as s3tables,
@@ -57,7 +58,6 @@ USAGE_EVENTS_SCHEMA = [
 
 
 class HubStack(Stack):
-    DEDUP_TTL_HOURS = 24
 
     def __init__(self, scope: Construct, id: str, *, cost_agg_interval_min: int = 5,
                  spoke_accounts: list[str] | None = None, alarm_email: str | None = None,
@@ -138,9 +138,11 @@ class HubStack(Stack):
                 bytes_scanned_cutoff_per_query=10 * 1024 ** 3,
             ),
         )
+        # Failed async invocations (incremental, settle) land here; both resume on the next run. Purge after review.
+        compute_failures = common.dead_letter_queue(self, "ComputeCostFailures", f"{id}-compute-cost-failures")
         compute_cost_fn = common.python_function(self, "ComputeCostFunction",
-            function_name=f"{id}-compute-cost", handler="compute_cost.handler", timeout_s=300,
-            retry_attempts=0,  # the next scheduled run resumes from the checkpoint
+            function_name=f"{id}-compute-cost", handler="compute_cost.handler", timeout_s=600, memory_mb=1024,
+            retry_attempts=0, on_failure=lambda_destinations.SqsDestination(compute_failures),
             environment={
                 "STACK_NAME": id,
                 "USAGE_STATS_TABLE": usage_stats_table.table_name,
@@ -149,7 +151,6 @@ class HubStack(Stack):
                 "ICEBERG_CATALOG": f"s3tablescatalog/{catalog['bucket_name']}",
                 "ICEBERG_DATABASE": ICEBERG_NAMESPACE,
                 "ICEBERG_TABLE": ICEBERG_TABLE,
-                "DEDUP_TTL_HOURS": str(self.DEDUP_TTL_HOURS),
             },
         )
         usage_stats_table.grant_read_write_data(compute_cost_fn)
@@ -161,19 +162,12 @@ class HubStack(Stack):
             targets=[targets.LambdaFunction(compute_cost_fn, retry_attempts=0)],
         )
 
-        # ── Rollups and pricing sync ──
-        aggregate_stats_fn = common.python_function(self, "AggregateStatsFunction",
-            function_name=f"{id}-aggregate-stats", handler="aggregate_stats.handler", timeout_s=300,
-            environment={"USAGE_STATS_TABLE": usage_stats_table.table_name})
-        usage_stats_table.grant_read_write_data(aggregate_stats_fn)
-        events.Rule(self, "DailyAggregateSchedule", rule_name=f"{id}-daily-aggregate",
-            schedule=events.Schedule.cron(minute="15", hour="0"),
-            targets=[targets.LambdaFunction(aggregate_stats_fn, event=events.RuleTargetInput.from_object({"type": "daily"}))])
-        # Days 1-3 so late events on the month's last day are folded in after the daily recompute.
-        events.Rule(self, "MonthlyAggregateSchedule", rule_name=f"{id}-monthly-aggregate",
-            schedule=events.Schedule.cron(minute="0", hour="1", day="1-3"),
-            targets=[targets.LambdaFunction(aggregate_stats_fn, event=events.RuleTargetInput.from_object({"type": "monthly"}))])
+        # Settle: recompute dirty and recently completed days (HOURLY + DAILY) and completed months from Iceberg.
+        events.Rule(self, "SettleSchedule", rule_name=f"{id}-settle",
+            schedule=events.Schedule.cron(minute="20"),
+            targets=[targets.LambdaFunction(compute_cost_fn, event=events.RuleTargetInput.from_object({"settle": {}}))])
 
+        # ── Pricing sync ──
         sync_pricing_fn = common.python_function(self, "SyncPricingFunction",
             function_name=f"{id}-sync-pricing", handler="sync_pricing.handler", timeout_s=120,
             environment={"MODEL_PRICING_TABLE": model_pricing_table.table_name,
@@ -199,8 +193,7 @@ class HubStack(Stack):
             CfnOutput(self, "SpokeWriteRoleArn", value=spoke_role.role_arn)
 
         # ── Alarms ──
-        for name, fn in (("ParseLog", parse_log_fn), ("ComputeCost", compute_cost_fn),
-                         ("AggregateStats", aggregate_stats_fn), ("SyncPricing", sync_pricing_fn)):
+        for name, fn in (("ParseLog", parse_log_fn), ("ComputeCost", compute_cost_fn), ("SyncPricing", sync_pricing_fn)):
             alarms.function_errors(f"{name}ErrorsAlarm", fn)
         alarms.dlq_depth("ParseLogDLQAlarm", parse_dlq)
         firehose_metric = lambda name, stat: cw.Metric(  # noqa: E731
@@ -209,12 +202,17 @@ class HubStack(Stack):
         alarms.add("FirehoseFailedRowsAlarm", firehose_metric("DeliveryToIceberg.FailedRowCount", "Sum"), 1,
                    "Firehose sent rows to the error backup prefix instead of Iceberg")
         alarms.add("FirehoseFreshnessAlarm", firehose_metric("DeliveryToIceberg.DataFreshness", "Maximum"), 900,
-                   "Oldest undelivered Firehose record is older than 15 minutes")
+                   "Oldest undelivered Firehose record is older than 15 minutes. Events visible more than 15 min after "
+                   "ingestion are picked up by settle for the last 2 days; run scripts/rebuild_costs.sh for older days")
         l2_metric = lambda name, stat, minutes: cw.Metric(  # noqa: E731
             namespace="BedrockAnalytics", metric_name=name, statistic=stat, period=Duration.minutes(minutes),
             dimensions_map={"Stack": id})
         alarms.add("L2LagAlarm", l2_metric("CheckpointLagSeconds", "Maximum", 15), 1800,
                    "L2 checkpoint is more than 30 minutes behind, or L2 stopped reporting",
+                   missing=cw.TreatMissingData.BREACHING)
+        alarms.dlq_depth("ComputeCostFailuresAlarm", compute_failures)
+        alarms.add("SettleLagAlarm", l2_metric("SettleLagHours", "Maximum", 60), 25,
+                   "Yesterday is not settled into DAILY 1-2 hours after midnight UTC, or settle stopped reporting",
                    missing=cw.TreatMissingData.BREACHING)
         alarms.add("UnpricedEventsAlarm", l2_metric("UnpricedEvents", "Sum", 60), 1,
                    "Invocations of models without a price; add pricing, then run scripts/rebuild_costs.sh")
@@ -233,7 +231,6 @@ class HubStack(Stack):
         CfnOutput(self, "UsageEventsFirehoseArn", value=stream.attr_arn)
         CfnOutput(self, "ParseLogFunctionName", value=parse_log_fn.function_name)
         CfnOutput(self, "ComputeCostFunctionName", value=compute_cost_fn.function_name)
-        CfnOutput(self, "AggregateStatsFunctionName", value=aggregate_stats_fn.function_name)
         CfnOutput(self, "AthenaWorkgroupName", value=workgroup.name)
 
     def _table(self, id: str, name: str, ttl: str | None = None) -> dynamodb.Table:
@@ -301,7 +298,8 @@ class HubStack(Stack):
         return {"bucket_name": bucket_name, "bucket_arn": bucket_arn, "table": table, "glue_catalog": glue_catalog}
 
     def _firehose(self, id: str, catalog: dict, ops_bucket: s3.Bucket) -> firehose.CfnDeliveryStream:
-        """DirectPut stream that upserts into the Iceberg table by request_id."""
+        """DirectPut stream into the Iceberg table. Records carry no operation, so writes are appends even though
+        unique_keys is set; readers deduplicate by request_id."""
         log_group = logs.LogGroup(self, "FirehoseLogGroup", log_group_name=f"/aws/kinesisfirehose/{id}-usage-events",
             retention=common.LOG_RETENTION, removal_policy=RemovalPolicy.DESTROY)
         log_stream = logs.LogStream(self, "FirehoseLogStream", log_group=log_group,

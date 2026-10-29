@@ -33,7 +33,7 @@ def _cw():
     return _clients["cw"]
 
 
-def _plan_segments(start_dt: datetime, end_dt: datetime) -> list[tuple[str, str, str]]:
+def _plan_segments(start_dt: datetime, end_dt: datetime, daily_end: datetime | None = None) -> list[tuple[str, str, str]]:
     """Plan storage-tier segments for [start_dt, end_dt) — any input tz, output SKs are UTC.
 
     The window is shaved progressively from both ends:
@@ -43,8 +43,8 @@ def _plan_segments(start_dt: datetime, end_dt: datetime) -> list[tuple[str, str,
       4. DAILY tail   — full UTC days after the last completed month, until today (UTC) starts
       5. HOURLY tail  — today's UTC hours up to e_utc
 
-    Each tier covers only the range it's allowed to (per the rollup contract: MONTHLY is
-    completed months only, DAILY is completed days only, today/in-progress hour is HOURLY).
+    DAILY rows are read only before `daily_end` (exclusive; default today's UTC midnight) and MONTHLY only for
+    months ending by then; later days come from HOURLY. Callers pass the day after the pk's SETTLED watermark.
     Returns a chronological list of (granularity, sk_start, sk_end) — empty if invalid.
     """
     s = start_dt.astimezone(timezone.utc)
@@ -53,7 +53,8 @@ def _plan_segments(start_dt: datetime, end_dt: datetime) -> list[tuple[str, str,
         return []
 
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    cur_month_start = today_start.replace(day=1)
+    daily_end = min(daily_end or today_start, today_start)
+    cur_month_start = daily_end.replace(day=1)
 
     segments: list[tuple[str, str, str]] = []
     cursor = s  # advances toward e
@@ -73,7 +74,7 @@ def _plan_segments(start_dt: datetime, end_dt: datetime) -> list[tuple[str, str,
     # Only run if cursor isn't already month-aligned — otherwise let MONTHLY take over.
     if cursor.day != 1:
         next_month = _next_month_start(cursor)
-        daily_head_end = min(next_month, today_start, e)
+        daily_head_end = min(next_month, daily_end, e)
         if cursor < daily_head_end:
             segments.append(("DAILY", cursor.strftime("%Y-%m-%d"),
                              (daily_head_end - timedelta(days=1)).strftime("%Y-%m-%d")))
@@ -94,8 +95,8 @@ def _plan_segments(start_dt: datetime, end_dt: datetime) -> list[tuple[str, str,
             if cursor >= e:
                 return segments
 
-    # ── 4. DAILY tail: full UTC days from cursor up to today_start (exclusive) ──
-    daily_tail_end = min(today_start, e)
+    # ── 4. DAILY tail: full UTC days from cursor up to daily_end (exclusive) ──
+    daily_tail_end = min(daily_end, e)
     if cursor < daily_tail_end:
         segments.append(("DAILY", cursor.strftime("%Y-%m-%d"),
                          (daily_tail_end - timedelta(days=1)).strftime("%Y-%m-%d")))
@@ -103,7 +104,7 @@ def _plan_segments(start_dt: datetime, end_dt: datetime) -> list[tuple[str, str,
         if cursor >= e:
             return segments
 
-    # ── 5. HOURLY tail: today's hours up to e ──
+    # ── 5. HOURLY tail: hours from daily_end (or the head) up to e ──
     if cursor < e:
         # e_hour_inclusive: include the hour containing e (so an end_dt like 12:50 hits SK ...T12)
         last_hour_inclusive = e if (e.minute, e.second, e.microsecond) == (0, 0, 0) else e + timedelta(hours=1)
@@ -121,6 +122,24 @@ def _next_month_start(dt: datetime) -> datetime:
     return base.replace(month=base.month + 1)
 
 
+HOURLY_RETENTION = timedelta(days=89)  # one day inside the 90-day HOURLY TTL
+
+
+def daily_end_for(account_region: str) -> datetime:
+    """Exclusive end of the DAILY tier for a pk: the day after META/SETTLED, or (no watermark) the start of the
+    HOURLY retention window so recent days read HOURLY and older days read whatever DAILY exists."""
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        item = _usage().get_item(Key={"PK": "META", "SK": f"SETTLED#{account_region}"}).get("Item") or {}
+        settled = datetime.strptime(item["day"], "%Y-%m-%d").replace(tzinfo=timezone.utc) if item.get("day") else None
+    except Exception as e:  # noqa: BLE001 — fall back to the conservative tiering rather than failing the request
+        print(f"[WARN] Failed to read SETTLED for {account_region}: {e}")
+        settled = None
+    if settled:
+        return min(settled + timedelta(days=1), today)
+    return today - HOURLY_RETENTION
+
+
 def get_l2_checkpoint() -> dict | None:
     """Read META/L2#latest. Returns None if L2 hasn't run yet (e.g. fresh deploy)."""
     try:
@@ -131,15 +150,14 @@ def get_l2_checkpoint() -> dict | None:
     return resp.get("Item")
 
 
-def unpriced_models(days: int = 7) -> list[str]:
-    """Models L2 counted at $0 within the last `days` (META/UNPRICED#<model>, cleared by a cost rebuild)."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+def unpriced_models() -> list[str]:
+    """Models with events counted at $0 (META/UNPRICED#<model>; cleared once a recompute covers them priced)."""
     try:
         items = _usage().query(KeyConditionExpression=Key("PK").eq("META") & Key("SK").begins_with("UNPRICED#"))["Items"]
     except Exception as e:  # noqa: BLE001 — a warning banner must not break the dashboard
         print(f"[WARN] Failed to read unpriced markers: {e}")
         return []
-    return sorted(i["SK"].removeprefix("UNPRICED#") for i in items if i.get("last_seen", "") >= cutoff)
+    return sorted(i["SK"].removeprefix("UNPRICED#") for i in items)
 
 
 def _account_names() -> dict[str, str]:
@@ -168,7 +186,8 @@ def get_accounts() -> list[dict]:
     return results
 
 
-def query_usage(account_region: str, segments: list[tuple[str, str, str]], dimension_prefix: str = "") -> list[dict]:
+def query_usage(account_region: str, segments: list[tuple[str, str, str]], dimension_prefix: str = "",
+                exact: bool = False) -> list[dict]:
     """Query usage stats across one or more storage-tier segments and concatenate results.
 
     Args:
@@ -191,7 +210,8 @@ def query_usage(account_region: str, segments: list[tuple[str, str, str]], dimen
             kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
 
         if dimension_prefix:
-            items = [i for i in items if _extract_dimension(i["SK"]).startswith(dimension_prefix)]
+            items = [i for i in items if (_extract_dimension(i["SK"]) == dimension_prefix if exact
+                                          else _extract_dimension(i["SK"]).startswith(dimension_prefix))]
 
         out.extend(_format_item(i) for i in items)
     return out
@@ -203,7 +223,7 @@ TOKEN_FIELDS = ("invocations", "input_tokens", "output_tokens", "cache_read_toke
 
 def get_dashboard_bundle(account_region: str, start_dt: datetime, end_dt: datetime, tz: tzinfo | None = None) -> dict:
     """Summary, by-model, by-caller and TOTAL trend from a single pass over the storage segments."""
-    items = query_usage(account_region, _plan_segments(start_dt, end_dt))
+    items = query_usage(account_region, _plan_segments(start_dt, end_dt, daily_end_for(account_region)))
     totals = [i for i in items if i["dimension"] == "TOTAL"]
     return {
         "summary": summarize(totals),
@@ -214,15 +234,15 @@ def get_dashboard_bundle(account_region: str, start_dt: datetime, end_dt: dateti
 
 
 def get_summary(account_region: str, start_dt: datetime, end_dt: datetime) -> dict:
-    return summarize(query_usage(account_region, _plan_segments(start_dt, end_dt), "TOTAL"))
+    return summarize(query_usage(account_region, _plan_segments(start_dt, end_dt, daily_end_for(account_region)), "TOTAL"))
 
 
 def get_by_model(account_region: str, start_dt: datetime, end_dt: datetime) -> list[dict]:
-    return group_by_model(query_usage(account_region, _plan_segments(start_dt, end_dt), "MODEL#"))
+    return group_by_model(query_usage(account_region, _plan_segments(start_dt, end_dt, daily_end_for(account_region)), "MODEL#"))
 
 
 def get_by_caller(account_region: str, start_dt: datetime, end_dt: datetime) -> list[dict]:
-    return group_by_caller(query_usage(account_region, _plan_segments(start_dt, end_dt), "CALLER#"))
+    return group_by_caller(query_usage(account_region, _plan_segments(start_dt, end_dt, daily_end_for(account_region)), "CALLER#"))
 
 
 def summarize(items: list[dict]) -> dict:
@@ -285,7 +305,7 @@ def get_trend(account_region: str, start_dt: datetime, end_dt: datetime,
     UTC-bucketed storage.
     """
     target = _pick_display_granularity(start_dt, end_dt)
-    items = query_usage(account_region, _plan_segments(start_dt, end_dt), dimension)
+    items = query_usage(account_region, _plan_segments(start_dt, end_dt, daily_end_for(account_region)), dimension, exact=True)
     return _rebucket(items, target, tz or timezone.utc)
 
 

@@ -2,7 +2,6 @@ from datetime import datetime, timezone
 
 import pytest
 
-import aggregate_stats as agg
 import bedrock_logging as bl
 import lf_admin
 import sync_pricing as sp
@@ -33,33 +32,6 @@ def test_price_comparison_is_numeric():
 @pytest.mark.parametrize("new, suspicious", [("0.004", False), ("0.03", True), ("0", True)])
 def test_suspicious_change_guard(new, suspicious):
     assert sp.is_suspicious_change({"input_per_1k": "0.003"}, {"input_per_1k": new}) is suspicious
-
-
-# ── aggregate_stats ──
-
-def test_days_to_roll_recomputes_recent_days():
-    days = agg.days_to_roll(NOW, "2026-10-27")
-    assert [d.strftime("%Y-%m-%d") for d in days] == ["2026-10-25", "2026-10-26", "2026-10-27"]
-
-
-def test_days_to_roll_fills_gap_after_old_watermark():
-    days = agg.days_to_roll(NOW, "2026-10-20")
-    assert days[0].strftime("%Y-%m-%d") == "2026-10-21" and days[-1].strftime("%Y-%m-%d") == "2026-10-27"
-
-
-def test_months_to_roll_always_includes_last_completed_month():
-    assert agg.months_to_roll(NOW, "2026-09") == [(2026, 9)]
-    assert agg.months_to_roll(NOW, "2026-07") == [(2026, 8), (2026, 9)]
-
-
-def test_aggregate_sums_and_extremes():
-    rows = agg.aggregate([
-        {"SK": "HOURLY#2026-10-27T01#TOTAL", "invocations": 2, "cost_request_micro": 5, "max_latency_ms": 10, "min_latency_ms": 3},
-        {"SK": "HOURLY#2026-10-27T02#TOTAL", "invocations": 1, "max_latency_ms": 20, "min_latency_ms": 0},
-    ])
-    total = rows["TOTAL"]
-    assert total["invocations"] == 3 and total["cost_request_micro"] == 5
-    assert total["max_latency_ms"] == 20 and total["min_latency_ms"] == 3
 
 
 # ── Bedrock logging custom resource ──

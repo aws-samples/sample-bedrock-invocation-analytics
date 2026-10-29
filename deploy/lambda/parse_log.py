@@ -6,7 +6,7 @@ Lambda L1: Parse Bedrock invocation log files from S3 and forward events to Fire
 Flow: S3 (.json.gz) → parse NDJSON → normalize → firehose.put_record() → Iceberg usage_events
 
 - No DDB writes here; L2 (compute_cost) is responsible for cost + aggregation
-- Firehose unique_keys=[request_id] handles upsert; duplicates on retry are safe
+- usage_events is append-only (re-sent files add duplicate rows); L2 deduplicates by request_id when reading
 - Body parsing branches on body type (dict vs list), not operation, for future-proofing
 - error_code events are still forwarded to Iceberg; L2 filters them when aggregating
 """
@@ -165,7 +165,7 @@ def build_event(record, path_account_id, path_region, source_s3_key):
 
     request_id = record.get("requestId") or ""
     if not request_id:
-        # No request_id → skip (Firehose upsert needs a key)
+        # No request_id → skip (L2 deduplicates by it)
         print(f"Record has no requestId, skipping")
         return None
 

@@ -1,29 +1,32 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 """
-Lambda L2: read usage events from Iceberg, price them, aggregate into the DynamoDB serving layer.
+Lambda L2: cost aggregation by recomputing whole periods from Iceberg.
 
-Incremental mode (EventBridge schedule):
-  Reads events by ingest time (`parsed_at`) from the checkpoint onward, so late or slow-to-deliver
-  events are never skipped. Each run re-reads OVERLAP_MINUTES before the checkpoint to cover
-  Firehose delivery delay; the DEDUP guard (PK=DEDUP, SK=request_id) keeps re-reads idempotent.
-  Any per-event failure fails the run and leaves the checkpoint in place, so the next run retries.
+Every write recomputes complete HOURLY / DAILY / MONTHLY rows from the deduplicated event log
+(usage_events is append-only, so one row per request_id is selected in SQL) and replaces the rows of
+that period. Rerunning any step is harmless. All writers hold the lease lock META/L2#lock.
 
-Rebuild mode ({"rebuild": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}}):
-  Recomputes HOURLY rows for whole hours from Iceberg with current pricing and overwrites them.
-  Only hours older than the incremental path's reach are touched, so the two never race.
-  Run the daily/monthly rollup afterwards (scripts/rebuild_costs.sh does both).
+Entry points (event payload):
+  {}                                    incremental: hours touched by newly ingested events (every few minutes)
+  {"settle": {}}                        dirty days, the last 2 completed days, catch-up after SETTLED (hourly)
+  {"rebuild": {"start", "end", "dry_run", "resume"}}  explicit range, resumable per month; returns
+                                        {"next": first day of the month to resume at} until done
 """
 
+import csv
+import io
 import json
 import os
 import time
+import uuid
 from collections import defaultdict
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 
 import boto3
-from boto3.dynamodb.conditions import Key
+
+import pricing
 
 STACK_NAME = os.environ.get("STACK_NAME", "BedrockInvocationAnalytics")
 USAGE_STATS_TABLE = os.environ.get("USAGE_STATS_TABLE", "")
@@ -32,477 +35,684 @@ ATHENA_WORKGROUP = os.environ.get("ATHENA_WORKGROUP", "")
 ICEBERG_CATALOG = os.environ.get("ICEBERG_CATALOG", "")
 ICEBERG_DATABASE = os.environ.get("ICEBERG_DATABASE", "bedrock_analytics")
 ICEBERG_TABLE = os.environ.get("ICEBERG_TABLE", "usage_events")
-DEDUP_TTL_HOURS = int(os.environ.get("DEDUP_TTL_HOURS", "24"))
 
-OVERLAP = timedelta(minutes=15)       # > Firehose buffer (60s) + delivery retries (300s)
-SETTLE = timedelta(seconds=60)
-MAX_CATCHUP = timedelta(hours=2)      # per run; keeps one run well inside the Lambda timeout
+OVERLAP = timedelta(minutes=15)       # > measured max visibility lag (263 s) with margin
+INGEST_SETTLE = timedelta(seconds=60)
+MAX_WINDOW = timedelta(hours=6)
 INITIAL_LOOKBACK = timedelta(hours=1)
-TS_LOOKBACK = timedelta(hours=24)     # partition-pruning bound on event time for incremental reads
-HOURLY_TTL_DAYS = 90
+HOURLY_TTL = timedelta(days=90)
+DAILY_TTL = timedelta(days=365)
+RECENT_COMPLETED_DAYS = 2
+MAX_CATCHUP_DAYS = 31
+COUNT_CHECK_DAYS = 90
+LOCK_WAIT_S = 120
+STOP_MARGIN_S = 60
+MONTH_MARGIN_S = 300  # a month needs two Athena queries (each ≤ 120 s) before its first write
 
 SUM_FIELDS = ("invocations", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
               "cost_micro_usd", "cost_input_micro", "cost_output_micro", "cost_cache_read_micro",
               "cost_cache_write_micro", "cost_request_micro", "latency_sum_ms", "tpot_sum", "tpot_count")
+MAX_FIELDS = ("max_latency_ms", "tpot_max")
+MIN_FIELDS = ("min_latency_ms", "tpot_min")
+VALUE_FIELDS = SUM_FIELDS + MAX_FIELDS + MIN_FIELDS
 
-_athena = None
-_ddb = None
-_pricing_cache: dict[tuple[str, str], dict | None] = {}
-
-
-def athena():
-    global _athena
-    _athena = _athena or boto3.client("athena")
-    return _athena
+_clients: dict = {}
 
 
-def ddb():
-    global _ddb
-    _ddb = _ddb or boto3.client("dynamodb")
-    return _ddb
+def client(name):
+    if name not in _clients:
+        _clients[name] = boto3.client(name)
+    return _clients[name]
 
 
-@dataclass
-class EventMetrics:
-    request_id: str
-    pk: str
-    hour_key: str
-    model_id: str
-    dims: list[str]
-    sums: dict[str, int]
-    latency_ms: int
-    tpot_micro: int
-    unpriced: bool
-    extremes: dict[str, int] = field(default_factory=dict)
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
+
+# ── Lease lock ──
+
+class LockBusy(Exception):
+    pass
+
+
+class Lease:
+    """META/L2#lock held for the rest of this invocation (+30 s). Expired leases can be taken over."""
+
+    def __init__(self, context, wait_s: int = 0):
+        self.owner, self.context, self.wait_s = str(uuid.uuid4()), context, wait_s
+
+    def __enter__(self):
+        deadline = time.time() + self.wait_s
+        while True:
+            now = int(time.time())
+            expires = now + remaining_s(self.context) + 30
+            try:
+                client("dynamodb").put_item(
+                    TableName=USAGE_STATS_TABLE,
+                    Item={"PK": {"S": "META"}, "SK": {"S": "L2#lock"}, "owner": {"S": self.owner},
+                          "expires_at": {"N": str(expires)}, "ttl": {"N": str(expires + 86400)}},
+                    ConditionExpression="attribute_not_exists(PK) OR expires_at < :now",
+                    ExpressionAttributeValues={":now": {"N": str(now)}})
+                return self
+            except client("dynamodb").exceptions.ConditionalCheckFailedException:
+                if time.time() >= deadline:
+                    raise LockBusy() from None
+                time.sleep(5)
+
+    def __exit__(self, *exc):
+        try:
+            client("dynamodb").delete_item(
+                TableName=USAGE_STATS_TABLE, Key={"PK": {"S": "META"}, "SK": {"S": "L2#lock"}},
+                ConditionExpression="#o = :me", ExpressionAttributeNames={"#o": "owner"},
+                ExpressionAttributeValues={":me": {"S": self.owner}})
+        except client("dynamodb").exceptions.ConditionalCheckFailedException:
+            print("Lock already taken over; not releasing")
+        return False
+
+
+def remaining_s(context) -> int:
+    return int(context.get_remaining_time_in_millis() / 1000) if context else 300
+
+
+# ── Entry point ──
 
 def handler(event, context):
-    _pricing_cache.clear()  # warm containers must see prices added or changed since the last run
-    if "rebuild" in event:
-        return rebuild(event["rebuild"], datetime.now(timezone.utc))
-    return run_incremental(datetime.now(timezone.utc))
-
-
-# ── Incremental path ──
-
-def plan_window(now: datetime, watermark: datetime | None) -> tuple[datetime, datetime, datetime]:
-    """Return (read_start, read_end, new_watermark) on the parsed_at axis."""
-    watermark = watermark or (now - INITIAL_LOOKBACK)
-    end = min((now - SETTLE).replace(microsecond=0), watermark + MAX_CATCHUP)
-    return watermark - OVERLAP, end, max(end, watermark)
-
-
-def run_incremental(now: datetime):
-    checkpoint = read_checkpoint()
-    watermark = _parse_iso(checkpoint.get("last_window_end")) if checkpoint else None
-    start, end, new_watermark = plan_window(now, watermark)
-    print(f"L2 window parsed_at=[{start.isoformat()}, {end.isoformat()})")
-
-    events = query_events(
-        f"parsed_at >= {_ts_literal(start)} AND parsed_at < {_ts_literal(end)} "
-        f"AND ts >= {_ts_literal(start - TS_LOOKBACK)}"
-    )
-    fresh = filter_unseen(events)
-    stats = {"read": len(events), "processed": 0, "skipped_dup": len(events) - len(fresh),
-             "skipped_bad": 0, "errors": 0, "unpriced": 0}
-    unpriced_models: set[str] = set()
-
-    for ev in fresh:
-        try:
-            m = to_metrics(ev, get_pricing)
-            if m is None:
-                stats["skipped_bad"] += 1
-                continue
-            if apply_event(m):
-                stats["processed"] += 1
-                if m.unpriced:
-                    stats["unpriced"] += 1
-                    unpriced_models.add(m.model_id)
-            else:
-                stats["skipped_dup"] += 1
-        except Exception as e:  # noqa: BLE001 — one bad event must not hide the rest; the run still fails below
-            stats["errors"] += 1
-            print(f"Error aggregating {ev.get('request_id')}: {e!r}")
-
-    if stats["errors"]:
-        emit_metrics(now, watermark or start, stats)
-        raise RuntimeError(f"L2 run had {stats['errors']} failed events; checkpoint held at {watermark}")
-
-    mark_unpriced(unpriced_models, now)
-    advance_checkpoint(new_watermark, now, stats)
-    emit_metrics(now, new_watermark, stats)
-    print(json.dumps({"window_end": new_watermark.isoformat(), **stats, "unpriced_models": sorted(unpriced_models)}))
-    return {**stats, "window_end": new_watermark.isoformat()}
-
-
-def filter_unseen(events: list[dict]) -> list[dict]:
-    """Drop events that already have a DEDUP marker (cheap BatchGet instead of a cancelled transaction)."""
-    by_id = {ev["request_id"]: ev for ev in events if ev.get("request_id")}
-    seen: set[str] = set()
-    ids = list(by_id)
-    for i in range(0, len(ids), 100):
-        request = {USAGE_STATS_TABLE: {"Keys": [{"PK": {"S": "DEDUP"}, "SK": {"S": rid}} for rid in ids[i:i + 100]],
-                                       "ProjectionExpression": "SK"}}
-        while request:
-            resp = ddb().batch_get_item(RequestItems=request)
-            seen.update(item["SK"]["S"] for item in resp.get("Responses", {}).get(USAGE_STATS_TABLE, []))
-            request = resp.get("UnprocessedKeys") or None
-            if request:
-                time.sleep(0.2)
-    return [ev for rid, ev in by_id.items() if rid not in seen]
-
-
-def apply_event(m: EventMetrics) -> bool:
-    """DEDUP put + ADD into every dimension row, atomically. False if the event was already counted."""
-    dedup_ttl = int(time.time()) + DEDUP_TTL_HOURS * 3600
-    agg_ttl = int(time.time()) + HOURLY_TTL_DAYS * 86400
-    items = [{"Put": {
-        "TableName": USAGE_STATS_TABLE,
-        "Item": {"PK": {"S": "DEDUP"}, "SK": {"S": m.request_id}, "ttl": {"N": str(dedup_ttl)}},
-        "ConditionExpression": "attribute_not_exists(SK)",
-    }}]
-    add_fields = [f for f in SUM_FIELDS if m.sums.get(f)]
-    values = {f":{f}": {"N": str(m.sums[f])} for f in add_fields}
-    values[":ttl"] = {"N": str(agg_ttl)}
-    add_clause = ("ADD " + ", ".join(f"{f} :{f}" for f in add_fields) + " ") if add_fields else ""
-    for dim in m.dims:
-        items.append({"Update": {
-            "TableName": USAGE_STATS_TABLE,
-            "Key": {"PK": {"S": m.pk}, "SK": {"S": f"HOURLY#{m.hour_key}#{dim}"}},
-            "UpdateExpression": add_clause + "SET #ttl = if_not_exists(#ttl, :ttl)",
-            "ExpressionAttributeValues": values,
-            "ExpressionAttributeNames": {"#ttl": "ttl"},
-        }})
+    now = utcnow()
     try:
-        ddb().transact_write_items(TransactItems=items)
-    except ddb().exceptions.TransactionCanceledException as e:
-        reasons = e.response.get("CancellationReasons") or []
-        if reasons and reasons[0].get("Code") == "ConditionalCheckFailed":
-            return False
-        raise
-
-    for dim in m.dims:
-        sk = f"HOURLY#{m.hour_key}#{dim}"
-        for attr, val in m.extremes.items():
-            _conditional_set(m.pk, sk, attr, val, "<" if attr in ("max_latency_ms", "tpot_max") else ">")
-    _register_account(m.pk)
-    return True
-
-
-def _conditional_set(pk, sk, attr, val, op):
-    """SET attr = val when attr is missing or `attr op val` (keeps running max/min)."""
-    try:
-        ddb().update_item(
-            TableName=USAGE_STATS_TABLE,
-            Key={"PK": {"S": pk}, "SK": {"S": sk}},
-            UpdateExpression=f"SET {attr} = :v",
-            ConditionExpression=f"attribute_not_exists({attr}) OR {attr} {op} :v",
-            ExpressionAttributeValues={":v": {"N": str(val)}},
-        )
-    except ddb().exceptions.ConditionalCheckFailedException:
-        pass
+        if "rebuild" in event:
+            with Lease(context, wait_s=LOCK_WAIT_S):
+                return run_rebuild(event["rebuild"], now, context)
+        if "settle" in event:
+            with Lease(context, wait_s=LOCK_WAIT_S):
+                return run_settle(now, context)
+        with Lease(context, wait_s=0):
+            return run_incremental(now, context)
+    except LockBusy:
+        emit(now, {"LockBusy": 1})
+        if "rebuild" in event:
+            raise  # rebuild_costs.sh retries with backoff
+        if "settle" in event:
+            emit(now, {"SettleLagHours": max((hours_since_settled(pk, now) for pk in list_accounts()), default=0)})
+        print("Lock busy; skipping this run")
+        return {"skipped": "lock busy"}
 
 
-def _register_account(pk):
-    now_iso = datetime.now(timezone.utc).isoformat()
-    ddb().update_item(
-        TableName=USAGE_STATS_TABLE,
-        Key={"PK": {"S": "META"}, "SK": {"S": f"ACCOUNT#{pk}"}},
-        UpdateExpression="SET registered_at = if_not_exists(registered_at, :now), last_seen = :now",
-        ExpressionAttributeValues={":now": {"S": now_iso}},
-    )
+# ── Incremental ──
 
+def run_incremental(now: datetime, context):
+    checkpoint = get_meta("L2#latest") or {}
+    watermark = parse_iso(checkpoint.get("last_window_end")) or (now - INITIAL_LOOKBACK)
+    start = watermark - OVERLAP
+    end = min((now - INGEST_SETTLE).replace(microsecond=0), watermark + MAX_WINDOW)
+    end = max(end, watermark)
 
-def read_checkpoint() -> dict | None:
-    item = ddb().get_item(TableName=USAGE_STATS_TABLE, Key={"PK": {"S": "META"}, "SK": {"S": "L2#latest"}}).get("Item")
-    return {k: next(iter(v.values())) for k, v in item.items()} if item else None
+    touched = athena_rows(f"""
+        SELECT DISTINCT account_id || '#' || region AS pk, date_format(ts, '%Y-%m-%dT%H') AS hour
+        FROM {table_ref()} WHERE parsed_at >= {ts_lit(start)} AND parsed_at < {ts_lit(end)}""")
+    current, previous = now.replace(minute=0, second=0, microsecond=0), now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+    pks = {r["pk"] for r in touched} | set(list_accounts())
+    hours = {(r["pk"], parse_hour(r["hour"])) for r in touched}
+    hours |= {(pk, h) for pk in pks for h in (current, previous)}
 
-
-def mark_unpriced(models: set[str], now: datetime):
-    """META/UNPRICED#<model> marks models counted at $0; the dashboard lists recent ones."""
-    for model in models:
-        ddb().update_item(
-            TableName=USAGE_STATS_TABLE,
-            Key={"PK": {"S": "META"}, "SK": {"S": f"UNPRICED#{model}"}},
-            UpdateExpression="SET last_seen = :now",
-            ExpressionAttributeValues={":now": {"S": now.isoformat()}},
-        )
-
-
-def clear_unpriced(models: set[str]):
-    for model in models:
-        ddb().delete_item(TableName=USAGE_STATS_TABLE, Key={"PK": {"S": "META"}, "SK": {"S": f"UNPRICED#{model}"}})
-
-
-def advance_checkpoint(window_end, processed_at, stats):
-    """Move the watermark forward only (a slower concurrent run can't drag it back)."""
-    try:
-        ddb().put_item(
-            TableName=USAGE_STATS_TABLE,
-            Item={
-                "PK": {"S": "META"}, "SK": {"S": "L2#latest"},
-                "last_window_end": {"S": window_end.isoformat()},
-                "processed_at": {"S": processed_at.isoformat()},
-                "events_processed": {"N": str(stats["processed"])},
-                "events_skipped_dup": {"N": str(stats["skipped_dup"])},
-                "events_unpriced": {"N": str(stats["unpriced"])},
-            },
-            ConditionExpression="attribute_not_exists(last_window_end) OR last_window_end <= :w",
-            ExpressionAttributeValues={":w": {"S": window_end.isoformat()}},
-        )
-    except ddb().exceptions.ConditionalCheckFailedException:
-        print("Checkpoint already ahead; leaving it")
-
-
-def emit_metrics(now, watermark, stats):
-    """CloudWatch Embedded Metric Format; alarms watch CheckpointLagSeconds and UnpricedEvents."""
-    print(json.dumps({
-        "_aws": {"Timestamp": int(now.timestamp() * 1000), "CloudWatchMetrics": [{
-            "Namespace": "BedrockAnalytics", "Dimensions": [["Stack"]],
-            "Metrics": [{"Name": "CheckpointLagSeconds", "Unit": "Seconds"},
-                        {"Name": "EventsProcessed", "Unit": "Count"},
-                        {"Name": "EventErrors", "Unit": "Count"},
-                        {"Name": "UnpricedEvents", "Unit": "Count"}],
-        }]},
-        "Stack": STACK_NAME,
-        "CheckpointLagSeconds": int((now - watermark).total_seconds()),
-        "EventsProcessed": stats["processed"],
-        "EventErrors": stats["errors"],
-        "UnpricedEvents": stats["unpriced"],
-    }))
-
-
-# ── Rebuild path ──
-
-def rebuild_bounds(spec: dict, now: datetime, watermark: datetime | None) -> tuple[datetime, datetime]:
-    """Whole hours in [start day, end day] that the incremental path can no longer write to."""
-    start = datetime.strptime(spec["start"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    end = datetime.strptime(spec.get("end") or spec["start"], "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
-    reach = (watermark or now) - OVERLAP - TS_LOOKBACK - timedelta(hours=1)
-    return start, min(end, reach.replace(minute=0, second=0, microsecond=0))
-
-
-def rebuild(spec: dict, now: datetime):
-    checkpoint = read_checkpoint()
-    start, end = rebuild_bounds(spec, now, _parse_iso(checkpoint.get("last_window_end")) if checkpoint else None)
-    if end <= start:
-        return {"rebuilt_rows": 0, "reason": "range is still within the incremental window"}
-
-    events = query_events(f"ts >= {_ts_literal(start)} AND ts < {_ts_literal(end)}", timeout_s=180)
-    rows: dict[tuple[str, str], dict[str, int]] = {}
-    unpriced: set[str] = set()
-    priced: set[str] = set()
-    for ev in events:
-        m = to_metrics(ev, get_pricing)
-        if m is None:
-            continue
-        (unpriced if m.unpriced else priced).add(m.model_id)
-        for dim in m.dims:
-            row = rows.setdefault((m.pk, f"HOURLY#{m.hour_key}#{dim}"), defaultdict(int))
-            merge_into(row, m)
-
-    pks = {pk for pk, _ in rows} | set(list_accounts())
-    first_hour, last_hour = start.strftime("%Y-%m-%dT%H"), (end - timedelta(hours=1)).strftime("%Y-%m-%dT%H")
-    stale = [(pk, item["SK"]["S"]) for pk in pks
-             for item in _query_sk_range(pk, f"HOURLY#{first_hour}", f"HOURLY#{last_hour}\xff")
-             if (pk, item["SK"]["S"]) not in rows]
-
-    table = boto3.resource("dynamodb").Table(USAGE_STATS_TABLE)
-    expired_cutoff = int(time.time())
-    written = 0
-    with table.batch_writer() as batch:
-        for pk, sk in stale:
-            batch.delete_item(Key={"PK": pk, "SK": sk})
-        for (pk, sk), values in rows.items():
-            hour = datetime.strptime(sk.split("#")[1], "%Y-%m-%dT%H").replace(tzinfo=timezone.utc)
-            ttl = int(hour.timestamp()) + HOURLY_TTL_DAYS * 86400
-            if ttl <= expired_cutoff:
-                continue
-            batch.put_item(Item={"PK": pk, "SK": sk, "ttl": ttl, "rebuilt_at": now.isoformat(), **values})
-            written += 1
-
-    clear_unpriced(priced - unpriced)
-    mark_unpriced(unpriced, now)
-    result = {"start": start.isoformat(), "end": end.isoformat(), "events": len(events),
-              "rebuilt_rows": written, "deleted_rows": len(stale), "unpriced_models": sorted(unpriced)}
-    print(json.dumps(result))
+    stats = recompute_hours(hours, now, context, dry_run=False)
+    today = now.date()
+    dirty = {(pk, h.date()) for pk, h in hours if h.date() < today}
+    for pk, day in dirty:
+        put_meta(f"DIRTY_DAY#{pk}#{day.isoformat()}", {"marked_at": now.isoformat()})
+    set_checkpoint(end, now)
+    register_accounts({pk for pk, _ in hours}, now)
+    emit(now, {"CheckpointLagSeconds": int((now - end).total_seconds()), "HoursRecomputed": len(hours),
+               "DirtyDays": len(dirty), "UnpricedEvents": stats["unpriced_events"],
+               "DataScannedInBytes": stats["scanned_bytes"]})
+    result = {"window_end": end.isoformat(), "hours": len(hours), "dirty_days": len(dirty), **stats}
+    print(json.dumps(result, default=str))
     return result
 
 
-def merge_into(row: dict, m: EventMetrics):
+# ── Settle and rebuild ──
+
+def run_settle(now: datetime, context):
+    yesterday = now.date() - timedelta(days=1)
+    pks = set(list_accounts()) | iceberg_pks()
+    days: dict[str, set[date]] = defaultdict(set)
+    markers = {}
+    for item in meta_items("DIRTY_DAY#"):
+        pk, day = item["SK"].removeprefix("DIRTY_DAY#").rsplit("#", 1)
+        days[pk].add(date.fromisoformat(day))
+        markers[(pk, day)] = item.get("marked_at")
+    check_due = count_check_due(now)
+    if check_due:
+        for pk, day in count_mismatches(now):
+            marked_at = now.isoformat()
+            put_meta(f"DIRTY_DAY#{pk}#{day.isoformat()}", {"marked_at": marked_at})
+            days[pk].add(day)
+            markers[(pk, day.isoformat())] = marked_at
+    for pk in pks:
+        settled = settled_day(pk, now)
+        catch_up = [settled + timedelta(days=n) for n in range(1, MAX_CATCHUP_DAYS + 1)
+                    if settled + timedelta(days=n) <= yesterday]
+        days[pk] |= set(catch_up)
+        days[pk] |= {yesterday - timedelta(days=n) for n in range(RECENT_COMPLETED_DAYS)}
+
+    result = settle_days(days, now, context, dry_run=False, markers=markers)
+    if check_due and result["next"] is None:
+        put_meta("COUNT_CHECK#latest", {"day": now.date().isoformat()})
+    lag = max((hours_since_settled(pk, now) for pk in pks), default=0)
+    emit(now, {"SettleLagHours": lag, "DaysSettled": result["days"], "UnpricedEvents": result["unpriced_events"]})
+    print(json.dumps(result, default=str))
+    return result
+
+
+def run_rebuild(spec: dict, now: datetime, context):
+    first_full = iceberg_first_complete_days()
+    if not first_full:
+        return {"done": True, "reason": "no events"}
+    yesterday = now.date() - timedelta(days=1)
+    requested = date.fromisoformat(spec["start"]) if spec.get("start") not in (None, "", "all") else min(first_full.values())
+    resume = date.fromisoformat(spec["resume"]) if spec.get("resume") else requested
+    end = min(date.fromisoformat(spec["end"]) if spec.get("end") else yesterday, yesterday)
+    if spec.get("start") == "all" and not spec.get("resume") and not spec.get("dry_run"):
+        for item in meta_items("UNPRICED#"):  # markers from before event-time spans; the full rebuild re-marks
+            if not item.get("first_seen"):
+                boto3.resource("dynamodb").Table(USAGE_STATS_TABLE).delete_item(Key={"PK": "META", "SK": item["SK"]})
+    days = {}
+    for pk, first in first_full.items():
+        start = max(requested, first, resume)
+        days[pk] = {start + timedelta(days=n) for n in range((end - start).days + 1)}
+    result = settle_days(days, now, context, dry_run=bool(spec.get("dry_run")), markers={}, first_full=first_full)
+    result["done"] = result["next"] is None
+    print(json.dumps(result, default=str))
+    return result
+
+
+def settle_days(days: dict[str, set[date]], now: datetime, context, dry_run: bool, markers: dict,
+                first_full: dict[str, date] | None = None) -> dict:
+    """Recompute HOURLY (within TTL) + DAILY for the requested days, month by month, and MONTHLY for completed
+    months touched. SETTLED and DIRTY_DAY markers advance per day in the current month and only after MONTHLY in
+    completed months. Stops before the time budget runs out and reports the month to resume at."""
+    by_month: dict[tuple[int, int], dict[str, set[date]]] = defaultdict(lambda: defaultdict(set))
+    for pk, ds in days.items():
+        for d in ds:
+            if d < now.date():
+                by_month[(d.year, d.month)][pk].add(d)
+    totals = {"days": 0, "puts": 0, "deletes": 0, "unpriced_events": 0, "scanned_bytes": 0, "diffs": []}
+    for (y, m) in sorted(by_month):
+        month_start = date(y, m, 1)
+        resume = {**totals, "diffs": trim_diffs(totals["diffs"]), "next": month_start.isoformat()}
+        if remaining_s(context) < MONTH_MARGIN_S:
+            return resume
+        month_end = next_month(month_start)
+        complete = month_end <= now.date()
+        wanted = by_month[(y, m)]
+        q_start = month_start if complete else min(min(v) for v in wanted.values())
+        q_end = month_end if complete else max(max(v) for v in wanted.values()) + timedelta(days=1)
+        hourly, unpriced, scanned = aggregate(day_start(q_start), day_start(q_end))
+        totals["scanned_bytes"] += scanned
+        totals["unpriced_events"] += sum(u["count"] for u in unpriced.values())
+        daily = rollup(hourly, "DAILY", lambda h: h[:10])
+        deferred = []  # (pk, day, marker) committed only after the month's MONTHLY rows are written
+        for pk in sorted(wanted):
+            for d in sorted(wanted[pk]):
+                if remaining_s(context) < STOP_MARGIN_S:
+                    return resume  # the month is redone next time; writes are diffs, so this is cheap
+                write_day(pk, d, hourly, daily, now, dry_run, totals)
+                if dry_run:
+                    continue
+                marker_at = markers.get((pk, d.isoformat()))
+                if complete:
+                    deferred.append((pk, d, marker_at))
+                else:
+                    advance_settled(pk, d, now)
+                    if marker_at is not None:
+                        delete_marker(pk, d, marker_at)
+        if complete:
+            monthly = rollup(hourly, "MONTHLY", lambda h: h[:7])
+            for pk in sorted(wanted):
+                if first_full and first_full.get(pk, month_start) > month_start:
+                    continue  # Iceberg covers this month only partly; keep the existing MONTHLY row
+                p, dl = replace_scope(pk, f"MONTHLY#{y:04d}-{m:02d}#", monthly.get(pk, {}), ttl=None,
+                                      dry_run=dry_run, diffs=totals["diffs"])
+                totals["puts"] += p; totals["deletes"] += dl
+            for pk, d, marker_at in deferred:
+                advance_settled(pk, d, now)
+                if marker_at is not None:
+                    delete_marker(pk, d, marker_at)
+        if not dry_run:
+            scope_days = {q_start + timedelta(days=n) for n in range((q_end - q_start).days)} - {now.date()}
+            fully_rewritten = all(scope_days <= wanted.get(pk, set()) for pk in set(wanted) | set(hourly))
+            if fully_rewritten:
+                update_unpriced(unpriced, day_start(q_start), day_start(q_end), now)
+            else:
+                mark_unpriced(unpriced, now)  # only part of the scope was rewritten; never clear here
+    return {**totals, "diffs": trim_diffs(totals["diffs"]), "next": None}
+
+
+def write_day(pk: str, d: date, hourly: dict, daily: dict, now: datetime, dry_run: bool, totals: dict):
+    """Replace one pk-day: HOURLY rows for hours still within TTL, then the DAILY rows."""
+    period_hours = {f"{d.isoformat()}T{h:02d}" for h in range(24)}
+    hour_rows = {sk: v for sk, v in hourly.get(pk, {}).items() if sk.split("#")[1] in period_hours}
+    day_rows = {sk: v for sk, v in daily.get(pk, {}).items() if sk.split("#")[1] == d.isoformat()}
+    writable_hours = {h for h in period_hours if parse_hour(h) + HOURLY_TTL > now}
+    current_hours = {i["SK"]: i for i in query_prefix(pk, f"HOURLY#{d.isoformat()}T")} if writable_hours else {}
+    for h in sorted(writable_hours):
+        p, dl = replace_scope(pk, f"HOURLY#{h}#", {sk: v for sk, v in hour_rows.items() if sk.split("#")[1] == h},
+                              ttl=int((parse_hour(h) + HOURLY_TTL).timestamp()), dry_run=dry_run, existing=current_hours)
+        totals["puts"] += p; totals["deletes"] += dl
+    p, dl = replace_scope(pk, f"DAILY#{d.isoformat()}#", day_rows, ttl=int((now + DAILY_TTL).timestamp()),
+                          dry_run=dry_run, diffs=totals["diffs"])
+    totals["puts"] += p; totals["deletes"] += dl
+    totals["days"] += 1
+
+
+def trim_diffs(diffs: list[dict], limit: int = 200) -> list[dict]:
+    """All periods whose invocations would drop, then the first other changes up to `limit`."""
+    drops = [d for d in diffs if d["drop"]]
+    return drops + [d for d in diffs if not d["drop"]][:max(limit - len(drops), 0)]
+
+
+def recompute_hours(hours: set[tuple[str, datetime]], now: datetime, context, dry_run: bool) -> dict:
+    """Recompute the given (pk, hour) HOURLY rows; hours are grouped into one query per month."""
+    stats = {"puts": 0, "deletes": 0, "unpriced_events": 0, "scanned_bytes": 0}
+    by_month = defaultdict(set)
+    for pk, h in hours:
+        by_month[(h.year, h.month)].add((pk, h))
+    for key in sorted(by_month):
+        group = by_month[key]
+        lo, hi = min(h for _, h in group), max(h for _, h in group) + timedelta(hours=1)
+        hourly, unpriced, scanned = aggregate(lo, hi)
+        stats["scanned_bytes"] += scanned
+        stats["unpriced_events"] += sum(u["count"] for u in unpriced.values())
+        for pk, h in sorted(group):
+            if h + HOURLY_TTL <= now:
+                continue
+            label = h.strftime("%Y-%m-%dT%H")
+            rows = {sk: v for sk, v in hourly.get(pk, {}).items() if sk.split("#")[1] == label}
+            p, d = replace_scope(pk, f"HOURLY#{label}#", rows, ttl=int((h + HOURLY_TTL).timestamp()), dry_run=dry_run)
+            stats["puts"] += p; stats["deletes"] += d
+        if not dry_run:
+            mark_unpriced(unpriced, now)
+    return stats
+
+
+# ── Aggregation in Athena ──
+
+def aggregate(ts_from: datetime, ts_to: datetime):
+    """HOURLY rows {pk: {sk: values}} for events with ts in [ts_from, ts_to), plus unpriced counts per model."""
+    models = {r["model_id"] for r in athena_rows(
+        f"SELECT DISTINCT coalesce(model_id, 'unknown') AS model_id FROM {table_ref()} "
+        f"WHERE ts >= {ts_lit(ts_from)} AND ts < {ts_lit(ts_to)} AND error_code IS NULL")}
+    versions = pricing.load_versions(boto3.resource("dynamodb").Table(PRICING_TABLE), models)
+    rows, scanned = athena_rows(aggregate_sql(ts_from, ts_to, pricing.values_table(versions)), with_scanned=True)
+    out: dict[str, dict[str, dict]] = defaultdict(dict)
+    unpriced: dict[str, dict] = {}
+    for r in rows:
+        kind = r["kind"]
+        if kind == "CALLER" and not r["caller"]:
+            continue
+        dim = {"MODEL": f"MODEL#{r['model_id']}", "CALLER": f"CALLER#{r['caller']}", "TOTAL": "TOTAL"}[kind]
+        values = {f: int(r[f] or 0) for f in VALUE_FIELDS}
+        out[r["pk"]][f"HOURLY#{r['hour']}#{dim}"] = {k: v for k, v in values.items() if v or k in SUM_FIELDS}
+        if kind == "MODEL" and int(r["unpriced"] or 0):
+            span = unpriced.setdefault(r["model_id"], {"count": 0, "first": None, "last": None})
+            first, last = athena_ts(r["unpriced_first"]), athena_ts(r["unpriced_last"])
+            span["count"] += int(r["unpriced"])
+            span["first"] = min(filter(None, (span["first"], first)))
+            span["last"] = max(filter(None, (span["last"], last)))
+    return out, unpriced, scanned
+
+
+def athena_ts(value: str | None) -> datetime | None:
+    """Athena timestamp text 'YYYY-MM-DD HH:MM:SS[.fff] UTC' → aware datetime."""
+    if not value:
+        return None
+    return datetime.fromisoformat(value[:19].replace(" ", "T")).replace(tzinfo=timezone.utc)
+
+
+def aggregate_sql(ts_from: datetime, ts_to: datetime, values: str) -> str:
+    cost = lambda col, p: f"(CAST({col} AS BIGINT) * coalesce({p}, 0) + 500) / 1000"  # noqa: E731
+    return f"""
+WITH ranked AS (
+  SELECT *, row_number() OVER (PARTITION BY request_id ORDER BY parsed_at) AS rn
+  FROM {table_ref()} WHERE ts >= {ts_lit(ts_from)} AND ts < {ts_lit(ts_to)}
+),
+e AS (
+  SELECT account_id || '#' || region AS pk, date_format(ts, '%Y-%m-%dT%H') AS hour, ts,
+         coalesce(model_id, 'unknown') AS model_id, coalesce(caller, '') AS caller,
+         coalesce(input_tokens, 0) AS inp, coalesce(output_tokens, 0) AS outp, coalesce(cache_read_tokens, 0) AS cr,
+         coalesce(cache_write_total_tokens, 0) AS cw_total,
+         CASE WHEN cache_write_5m_tokens IS NULL AND cache_write_1h_tokens IS NULL THEN coalesce(cache_write_total_tokens, 0)
+              ELSE coalesce(cache_write_5m_tokens, 0) END AS cw5,
+         CASE WHEN cache_write_5m_tokens IS NULL AND cache_write_1h_tokens IS NULL THEN 0
+              ELSE coalesce(cache_write_1h_tokens, 0) END AS cw1,
+         CAST(coalesce(latency_ms, 0) AS BIGINT) AS lat
+  FROM ranked WHERE rn = 1 AND error_code IS NULL
+),
+prices (pm, eff_from, eff_to, p_in, p_out, p_cr, p_cw, p_cw1h, p_req) AS (VALUES
+{values}
+),
+c AS (
+  SELECT e.*, p.pm IS NULL AS unpriced_flag,
+         {cost('inp', 'p_in')} AS c_in, {cost('outp', 'p_out')} AS c_out, {cost('cr', 'p_cr')} AS c_cr,
+         {cost('cw5', 'p_cw')} + {cost('cw1', 'p_cw1h')} AS c_cw, coalesce(p_req, 0) AS c_req,
+         CASE WHEN outp > 0 AND lat > 0 THEN (lat * 2000 + outp) / (2 * outp) END AS tpot
+  FROM e LEFT JOIN prices p ON p.pm = e.model_id AND e.ts >= p.eff_from AND e.ts < p.eff_to
+)
+SELECT pk, hour, model_id, caller,
+       CASE WHEN grouping(model_id) = 0 THEN 'MODEL' WHEN grouping(caller) = 0 THEN 'CALLER' ELSE 'TOTAL' END AS kind,
+       count(*) AS invocations, sum(inp) AS input_tokens, sum(outp) AS output_tokens, sum(cr) AS cache_read_tokens,
+       sum(cw_total) AS cache_write_tokens,
+       sum(c_in + c_out + c_cr + c_cw + c_req) AS cost_micro_usd, sum(c_in) AS cost_input_micro, sum(c_out) AS cost_output_micro,
+       sum(c_cr) AS cost_cache_read_micro, sum(c_cw) AS cost_cache_write_micro, sum(c_req) AS cost_request_micro,
+       sum(lat) AS latency_sum_ms, coalesce(sum(tpot), 0) AS tpot_sum, count(tpot) AS tpot_count,
+       coalesce(max(CASE WHEN lat > 0 THEN lat END), 0) AS max_latency_ms,
+       coalesce(min(CASE WHEN lat > 0 THEN lat END), 0) AS min_latency_ms,
+       coalesce(max(tpot), 0) AS tpot_max, coalesce(min(tpot), 0) AS tpot_min,
+       count_if(unpriced_flag) AS unpriced,
+       CAST(min(CASE WHEN unpriced_flag THEN ts END) AS VARCHAR) AS unpriced_first,
+       CAST(max(CASE WHEN unpriced_flag THEN ts END) AS VARCHAR) AS unpriced_last
+FROM c GROUP BY GROUPING SETS ((pk, hour, model_id), (pk, hour, caller), (pk, hour))
+"""
+
+
+def rollup(hourly: dict[str, dict[str, dict]], granularity: str, period_of) -> dict[str, dict[str, dict]]:
+    """Merge HOURLY rows into DAILY or MONTHLY rows: sums add, max/min merge (0 means no value)."""
+    out: dict[str, dict[str, dict]] = defaultdict(dict)
+    for pk, rows in hourly.items():
+        for sk, values in rows.items():
+            _, hour, dim = sk.split("#", 2)
+            target = out[pk].setdefault(f"{granularity}#{period_of(hour)}#{dim}", {f: 0 for f in SUM_FIELDS})
+            merge(target, values)
+    return out
+
+
+def merge(target: dict, values: dict):
     for f in SUM_FIELDS:
-        row[f] += m.sums.get(f, 0)
-    for attr, val in m.extremes.items():
-        if attr in ("max_latency_ms", "tpot_max"):
-            row[attr] = max(row.get(attr, 0), val)
-        else:
-            row[attr] = val if not row.get(attr) else min(row[attr], val)
+        target[f] = target.get(f, 0) + values.get(f, 0)
+    for f in MAX_FIELDS:
+        if values.get(f):
+            target[f] = max(target.get(f, 0), values[f])
+    for f in MIN_FIELDS:
+        if values.get(f):
+            target[f] = values[f] if not target.get(f) else min(target[f], values[f])
 
 
-def list_accounts() -> list[str]:
-    return [i["SK"]["S"].removeprefix("ACCOUNT#") for i in _query_sk_range("META", "ACCOUNT#", "ACCOUNT#\xff")]
+# ── DynamoDB writes ──
+
+def replace_scope(pk: str, prefix: str, rows: dict[str, dict], ttl: int | None, dry_run: bool, diffs: list | None = None,
+                  existing: dict[str, dict] | None = None):
+    """Make the rows under (pk, prefix) equal `rows`: put changed or new rows, then delete vanished ones.
+    `existing` may carry the current rows of the scope when the caller already queried a wider prefix."""
+    if existing is None:
+        existing = {i["SK"]: i for i in query_prefix(pk, prefix)}
+    else:
+        existing = {sk: v for sk, v in existing.items() if sk.startswith(prefix)}
+    puts = [(sk, v) for sk, v in rows.items() if not same_values(existing.get(sk), v)]
+    deletes = [sk for sk in existing if sk not in rows]
+    if diffs is not None and (puts or deletes) and prefix.startswith(("DAILY#", "MONTHLY#")):
+        old = int((existing.get(prefix + "TOTAL") or {}).get("invocations", 0))
+        new = int((rows.get(prefix + "TOTAL") or {}).get("invocations", 0))
+        diffs.append({"pk": pk, "period": prefix.split("#")[1], "invocations_before": old, "invocations_after": new,
+                      "puts": len(puts), "deletes": len(deletes), "drop": new < old})
+    if dry_run:
+        return len(puts), len(deletes)
+    table = boto3.resource("dynamodb").Table(USAGE_STATS_TABLE)
+    computed_at = utcnow().isoformat()
+    with table.batch_writer() as batch:
+        for sk, values in puts:
+            item = {"PK": pk, "SK": sk, "computed_at": computed_at, **values}
+            if ttl is not None:
+                item["ttl"] = ttl
+            batch.put_item(Item=item)
+    with table.batch_writer() as batch:
+        for sk in deletes:
+            batch.delete_item(Key={"PK": pk, "SK": sk})
+    return len(puts), len(deletes)
 
 
-def _query_sk_range(pk, sk_start, sk_end):
-    kwargs = {"TableName": USAGE_STATS_TABLE,
-              "KeyConditionExpression": "PK = :pk AND SK BETWEEN :a AND :b",
-              "ExpressionAttributeValues": {":pk": {"S": pk}, ":a": {"S": sk_start}, ":b": {"S": sk_end}},
-              "ProjectionExpression": "SK"}
+def same_values(item: dict | None, values: dict) -> bool:
+    if item is None:
+        return False
+    return all(int(item.get(f, 0)) == int(values.get(f, 0)) for f in VALUE_FIELDS)
+
+
+def query_prefix(pk: str, prefix: str):
+    table = boto3.resource("dynamodb").Table(USAGE_STATS_TABLE)
+    kwargs = {"KeyConditionExpression": "PK = :pk AND begins_with(SK, :p)",
+              "ExpressionAttributeValues": {":pk": pk, ":p": prefix}}
     while True:
-        resp = ddb().query(**kwargs)
+        resp = table.query(**kwargs)
         yield from resp.get("Items", [])
         if "LastEvaluatedKey" not in resp:
             return
         kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
 
 
-# ── Shared: event → metrics ──
+# ── META items ──
 
-def to_metrics(ev: dict, pricing_lookup) -> EventMetrics | None:
-    """Pure transform of one Iceberg row into additive aggregates. None if the row is unusable."""
-    request_id = ev.get("request_id") or ""
-    iso_ts = _athena_ts_to_iso(ev.get("ts") or "")
-    if not request_id or not iso_ts:
-        print(f"Skipping unusable event request_id={request_id!r} ts={ev.get('ts')!r}")
-        return None
+def get_meta(sk: str) -> dict | None:
+    item = boto3.resource("dynamodb").Table(USAGE_STATS_TABLE).get_item(Key={"PK": "META", "SK": sk}).get("Item")
+    return {k: (int(v) if isinstance(v, Decimal) else v) for k, v in item.items()} if item else None
 
-    model_id = ev.get("model_id") or "unknown"
-    caller = ev.get("caller") or ""
-    input_tokens = _int(ev.get("input_tokens"))
-    output_tokens = _int(ev.get("output_tokens"))
-    cache_read = _int(ev.get("cache_read_tokens"))
-    cache_write_total = _int(ev.get("cache_write_total_tokens"))
-    if ev.get("cache_write_5m_tokens") is None and ev.get("cache_write_1h_tokens") is None:
-        cache_write_5m, cache_write_1h = cache_write_total, 0  # Converse API doesn't expose the split
+
+def put_meta(sk: str, attrs: dict):
+    boto3.resource("dynamodb").Table(USAGE_STATS_TABLE).put_item(Item={"PK": "META", "SK": sk, **attrs})
+
+
+def meta_items(prefix: str) -> list[dict]:
+    return list(query_prefix("META", prefix))
+
+
+def list_accounts() -> list[str]:
+    return [i["SK"].removeprefix("ACCOUNT#") for i in meta_items("ACCOUNT#")]
+
+
+def register_accounts(pks: set[str], now: datetime):
+    table = boto3.resource("dynamodb").Table(USAGE_STATS_TABLE)
+    for pk in pks:
+        table.update_item(Key={"PK": "META", "SK": f"ACCOUNT#{pk}"},
+                          UpdateExpression="SET registered_at = if_not_exists(registered_at, :n), last_seen = :n",
+                          ExpressionAttributeValues={":n": now.isoformat()})
+
+
+def set_checkpoint(window_end: datetime, now: datetime):
+    """Forward-only, so a slower concurrent run can never move it back."""
+    try:
+        boto3.resource("dynamodb").Table(USAGE_STATS_TABLE).put_item(
+            Item={"PK": "META", "SK": "L2#latest", "last_window_end": window_end.isoformat(), "processed_at": now.isoformat()},
+            ConditionExpression="attribute_not_exists(last_window_end) OR last_window_end <= :w",
+            ExpressionAttributeValues={":w": window_end.isoformat()})
+    except client("dynamodb").exceptions.ConditionalCheckFailedException:
+        print("Checkpoint already ahead")
+
+
+def settled_day(pk: str, now: datetime) -> date:
+    """META/SETTLED#pk: last day of the contiguous settled prefix. Initialized once (attribute_not_exists) to the last
+    day that already has a DAILY TOTAL row; a pk without DAILY rows starts the day before its first Iceberg event."""
+    item = get_meta(f"SETTLED#{pk}")
+    if item:
+        return date.fromisoformat(item["day"])
+    last = [i["SK"].split("#")[1] for i in query_prefix(pk, "DAILY#") if i["SK"].endswith("#TOTAL")]
+    if last:
+        initial = date.fromisoformat(max(last))
     else:
-        cache_write_5m, cache_write_1h = _int(ev.get("cache_write_5m_tokens")), _int(ev.get("cache_write_1h_tokens"))
-    latency_ms = _int(ev.get("latency_ms"))
-
-    pricing = pricing_lookup(model_id, iso_ts)
-    p = pricing or {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cache_write_1h": 0, "request": 0}
-    cost_input = _cost(input_tokens, p["input"])
-    cost_output = _cost(output_tokens, p["output"])
-    cost_cache_read = _cost(cache_read, p["cache_read"])
-    cost_cache_write = _cost(cache_write_5m, p["cache_write"]) + _cost(cache_write_1h, p["cache_write_1h"])
-    cost_request = p["request"]
-
-    has_tpot = output_tokens > 0 and latency_ms > 0
-    tpot_micro = round(latency_ms * 1000 / output_tokens) if has_tpot else 0
-    extremes = {}
-    if latency_ms > 0:
-        extremes.update(max_latency_ms=latency_ms, min_latency_ms=latency_ms)
-    if has_tpot:
-        extremes.update(tpot_max=tpot_micro, tpot_min=tpot_micro)
-
-    dims = [f"MODEL#{model_id}", "TOTAL"] + ([f"CALLER#{caller}"] if caller else [])
-    return EventMetrics(
-        request_id=request_id,
-        pk=f"{ev.get('account_id') or ''}#{ev.get('region') or ''}",
-        hour_key=iso_ts[:13],
-        model_id=model_id,
-        dims=dims,
-        sums={
-            "invocations": 1, "input_tokens": input_tokens, "output_tokens": output_tokens,
-            "cache_read_tokens": cache_read, "cache_write_tokens": cache_write_total,
-            "cost_micro_usd": cost_input + cost_output + cost_cache_read + cost_cache_write + cost_request,
-            "cost_input_micro": cost_input, "cost_output_micro": cost_output,
-            "cost_cache_read_micro": cost_cache_read, "cost_cache_write_micro": cost_cache_write,
-            "cost_request_micro": cost_request, "latency_sum_ms": latency_ms,
-            "tpot_sum": tpot_micro if has_tpot else 0, "tpot_count": 1 if has_tpot else 0,
-        },
-        latency_ms=latency_ms,
-        tpot_micro=tpot_micro,
-        unpriced=pricing is None,
-        extremes=extremes,
-    )
+        first = iceberg_first_day(pk)
+        initial = (first - timedelta(days=1)) if first else (now.date() - timedelta(days=1))
+    try:
+        boto3.resource("dynamodb").Table(USAGE_STATS_TABLE).put_item(
+            Item={"PK": "META", "SK": f"SETTLED#{pk}", "day": initial.isoformat()},
+            ConditionExpression="attribute_not_exists(PK)")
+    except client("dynamodb").exceptions.ConditionalCheckFailedException:
+        return date.fromisoformat(get_meta(f"SETTLED#{pk}")["day"])
+    return initial
 
 
-def get_pricing(model_id: str, iso_ts: str) -> dict | None:
-    """Effective price at iso_ts in micro-USD (per 1k tokens, or per request). None if the model has no price."""
-    cache_key = (model_id, iso_ts[:10])
-    if cache_key in _pricing_cache:
-        return _pricing_cache[cache_key]
-    items = boto3.resource("dynamodb").Table(PRICING_TABLE).query(
-        KeyConditionExpression=Key("PK").eq(f"MODEL#{model_id}") & Key("SK").lte(iso_ts),
-        ScanIndexForward=False, Limit=1,
-    ).get("Items", [])
-    result = None
-    if items:
-        item = items[0]
-        micro = lambda f: int(round(float(item.get(f, 0) or 0) * 1_000_000))  # noqa: E731
-        cache_write = micro("cache_write_per_1k")
-        result = {
-            "input": micro("input_per_1k"), "output": micro("output_per_1k"),
-            "cache_read": micro("cache_read_per_1k"), "cache_write": cache_write,
-            "cache_write_1h": micro("cache_write_1h_per_1k") or cache_write,
-            "request": micro("per_request"),
-        }
-    _pricing_cache[cache_key] = result
-    return result
+def advance_settled(pk: str, day: date, now: datetime):
+    """Extend the contiguous settled prefix by one day when `day` directly follows it."""
+    current = settled_day(pk, now)
+    if day != current + timedelta(days=1):
+        return
+    try:
+        boto3.resource("dynamodb").Table(USAGE_STATS_TABLE).put_item(
+            Item={"PK": "META", "SK": f"SETTLED#{pk}", "day": day.isoformat()},
+            ConditionExpression="#d = :cur", ExpressionAttributeNames={"#d": "day"},
+            ExpressionAttributeValues={":cur": current.isoformat()})
+    except client("dynamodb").exceptions.ConditionalCheckFailedException:
+        pass
 
 
-def query_events(where: str, timeout_s: int = 60) -> list[dict]:
-    """Run an Athena SELECT over the Iceberg table (successful calls only) and return rows as dicts."""
-    sql = f"""
-    SELECT account_id, region, request_id, ts, operation, model_id, caller,
-           input_tokens, output_tokens, cache_read_tokens,
-           cache_write_5m_tokens, cache_write_1h_tokens, cache_write_total_tokens, latency_ms
-    FROM "{ICEBERG_CATALOG}"."{ICEBERG_DATABASE}"."{ICEBERG_TABLE}"
-    WHERE {where} AND error_code IS NULL
-    """
-    qid = athena().start_query_execution(QueryString=sql, WorkGroup=ATHENA_WORKGROUP)["QueryExecutionId"]
+def hours_since_settled(pk: str, now: datetime) -> int:
+    item = get_meta(f"SETTLED#{pk}")
+    if not item:
+        return 0
+    end = day_start(date.fromisoformat(item["day"]) + timedelta(days=1))
+    return int((now - end).total_seconds() // 3600)
+
+
+def delete_marker(pk: str, day: date, marked_at: str):
+    """Remove a DIRTY_DAY marker only if no newer event re-marked it while the day was being recomputed."""
+    try:
+        boto3.resource("dynamodb").Table(USAGE_STATS_TABLE).delete_item(
+            Key={"PK": "META", "SK": f"DIRTY_DAY#{pk}#{day.isoformat()}"},
+            ConditionExpression="marked_at = :m", ExpressionAttributeValues={":m": marked_at})
+    except client("dynamodb").exceptions.ConditionalCheckFailedException:
+        pass
+
+
+def mark_unpriced(unpriced: dict[str, dict], now: datetime):
+    """META/UNPRICED#model holds the event-time span [first_seen, last_seen] of events counted at $0."""
+    table = boto3.resource("dynamodb").Table(USAGE_STATS_TABLE)
+    for model, span in unpriced.items():
+        current = get_meta(f"UNPRICED#{model}") or {}
+        first = min(filter(None, (parse_iso(current.get("first_seen")), span["first"])))
+        last = max(filter(None, (parse_iso(current.get("last_seen")), span["last"])))
+        table.put_item(Item={"PK": "META", "SK": f"UNPRICED#{model}", "first_seen": first.isoformat(),
+                             "last_seen": last.isoformat(), "updated_at": now.isoformat()})
+
+
+def update_unpriced(unpriced: dict[str, dict], scope_from: datetime, scope_to: datetime, now: datetime):
+    """Mark models still unpriced; clear a marker only if this recompute covered its whole event-time span."""
+    mark_unpriced(unpriced, now)
+    table = boto3.resource("dynamodb").Table(USAGE_STATS_TABLE)
+    for item in meta_items("UNPRICED#"):
+        model = item["SK"].removeprefix("UNPRICED#")
+        if model in unpriced:
+            continue
+        first, last = parse_iso(item.get("first_seen")), parse_iso(item.get("last_seen"))
+        if not (first and last) or not (scope_from <= first < scope_to):
+            continue
+        if last < scope_to:
+            table.delete_item(Key={"PK": "META", "SK": item["SK"]})
+        else:  # this scope priced the leading part of the span; the rest stays flagged
+            table.update_item(Key={"PK": "META", "SK": item["SK"]}, UpdateExpression="SET first_seen = :f",
+                              ExpressionAttributeValues={":f": scope_to.isoformat()})
+
+
+# ── Count check (catches events that became visible after their period settled) ──
+
+def count_check_due(now: datetime) -> bool:
+    last = (get_meta("COUNT_CHECK#latest") or {}).get("day")
+    return last != now.date().isoformat()
+
+
+def count_mismatches(now: datetime) -> list[tuple[str, date]]:
+    start = now.date() - timedelta(days=COUNT_CHECK_DAYS)
+    first_full = iceberg_first_complete_days()
+    rows = athena_rows(f"""
+        SELECT pk, day, count(*) AS n FROM (
+          SELECT request_id, arbitrary(account_id || '#' || region) AS pk, arbitrary(date_format(ts, '%Y-%m-%d')) AS day
+          FROM {table_ref()} WHERE ts >= {ts_lit(day_start(start))} AND ts < {ts_lit(day_start(now.date()))}
+            AND error_code IS NULL GROUP BY request_id) GROUP BY pk, day""")
+    out = []
+    for r in rows:
+        d = date.fromisoformat(r["day"])
+        if d < first_full.get(r["pk"], d):
+            continue  # Iceberg covers this day only partly; its DAILY row came from elsewhere
+        item = boto3.resource("dynamodb").Table(USAGE_STATS_TABLE).get_item(
+            Key={"PK": r["pk"], "SK": f"DAILY#{r['day']}#TOTAL"}).get("Item")
+        if d <= settled_day(r["pk"], now) and int((item or {}).get("invocations", 0)) != int(r["n"]):
+            out.append((r["pk"], d))
+    return out
+
+
+# ── Iceberg helpers ──
+
+def iceberg_pks() -> set[str]:
+    return {r["pk"] for r in athena_rows(f"SELECT DISTINCT account_id || '#' || region AS pk FROM {table_ref()}")}
+
+
+def iceberg_first_day(pk: str) -> date | None:
+    acct, region = pk.split("#", 1)
+    rows = athena_rows(f"SELECT date_format(min(ts), '%Y-%m-%d') AS d FROM {table_ref()} "
+                       f"WHERE account_id = '{sql_str(acct)}' AND region = '{sql_str(region)}'")
+    return date.fromisoformat(rows[0]["d"]) if rows and rows[0]["d"] else None
+
+
+def iceberg_first_complete_days() -> dict[str, date]:
+    """First UTC day fully covered by Iceberg, per pk (a day starting mid-way was partly recorded elsewhere)."""
+    out = {}
+    for r in athena_rows(f"SELECT account_id || '#' || region AS pk, CAST(min(ts) AS VARCHAR) AS t FROM {table_ref()} GROUP BY 1"):
+        first = athena_ts(r["t"])
+        out[r["pk"]] = first.date() if first == day_start(first.date()) else first.date() + timedelta(days=1)
+    return out
+
+
+def athena_rows(sql: str, with_scanned: bool = False, timeout_s: int = 120):
+    """Run a query (result reuse off) and read the CSV result from S3."""
+    qid = client("athena").start_query_execution(
+        QueryString=sql, WorkGroup=ATHENA_WORKGROUP,
+        ResultReuseConfiguration={"ResultReuseByAgeConfiguration": {"Enabled": False}})["QueryExecutionId"]
     deadline = time.time() + timeout_s
     while True:
-        status = athena().get_query_execution(QueryExecutionId=qid)["QueryExecution"]["Status"]
-        if status["State"] == "SUCCEEDED":
+        q = client("athena").get_query_execution(QueryExecutionId=qid)["QueryExecution"]
+        state = q["Status"]["State"]
+        if state == "SUCCEEDED":
             break
-        if status["State"] in ("FAILED", "CANCELLED"):
-            raise RuntimeError(f"Athena query {qid} {status['State']}: {status.get('StateChangeReason', '')}")
+        if state in ("FAILED", "CANCELLED"):
+            raise RuntimeError(f"Athena query {qid} {state}: {q['Status'].get('StateChangeReason', '')}")
         if time.time() > deadline:
-            athena().stop_query_execution(QueryExecutionId=qid)
+            client("athena").stop_query_execution(QueryExecutionId=qid)
             raise TimeoutError(f"Athena query {qid} exceeded {timeout_s}s")
         time.sleep(0.5)
-
-    rows, header = [], None
-    for page in athena().get_paginator("get_query_results").paginate(QueryExecutionId=qid):
-        for row in page["ResultSet"]["Rows"]:
-            cells = [c.get("VarCharValue") for c in row["Data"]]
-            if header is None:
-                header = cells
-                continue
-            rows.append(dict(zip(header, cells)))
+    bucket, key = q["ResultConfiguration"]["OutputLocation"].removeprefix("s3://").split("/", 1)
+    body = client("s3").get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
+    rows = list(csv.DictReader(io.StringIO(body)))
+    if with_scanned:
+        return rows, int(q.get("Statistics", {}).get("DataScannedInBytes", 0))
     return rows
 
 
-def _cost(tokens: int, micro_per_1k: int) -> int:
-    """Micro-USD, rounded half-up per event (floor division under-counted small calls)."""
-    return (tokens * micro_per_1k + 500) // 1000
+def table_ref() -> str:
+    return f'"{ICEBERG_CATALOG}"."{ICEBERG_DATABASE}"."{ICEBERG_TABLE}"'
 
 
-def _ts_literal(dt: datetime) -> str:
+# ── Small helpers ──
+
+def emit(now: datetime, metrics: dict):
+    """CloudWatch Embedded Metric Format, namespace BedrockAnalytics, dimension Stack."""
+    print(json.dumps({"_aws": {"Timestamp": int(now.timestamp() * 1000), "CloudWatchMetrics": [{
+        "Namespace": "BedrockAnalytics", "Dimensions": [["Stack"]],
+        "Metrics": [{"Name": k} for k in metrics]}]}, "Stack": STACK_NAME, **metrics}))
+
+
+def ts_lit(dt: datetime) -> str:
     return f"from_iso8601_timestamp('{dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}')"
 
 
-def _parse_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+def sql_str(value: str) -> str:
+    return value.replace("'", "''")
 
 
-def _athena_ts_to_iso(ts_str: str) -> str | None:
-    """Athena 'YYYY-MM-DD HH:MM:SS[.fff] [UTC]' → 'YYYY-MM-DDTHH:MM:SS' (UTC)."""
-    if not ts_str or len(ts_str) < 19:
-        return None
-    head = ts_str[:19].replace(" ", "T", 1)
-    try:
-        datetime.strptime(head, "%Y-%m-%dT%H:%M:%S")
-    except ValueError:
-        return None
-    return head
+def parse_iso(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
 
 
-def _int(v) -> int:
-    try:
-        return int(v) if v not in (None, "") else 0
-    except (TypeError, ValueError):
-        return 0
+def parse_hour(label: str) -> datetime:
+    return datetime.strptime(label, "%Y-%m-%dT%H").replace(tzinfo=timezone.utc)
+
+
+def day_start(d: date) -> datetime:
+    return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+
+
+def next_month(d: date) -> date:
+    return date(d.year + 1, 1, 1) if d.month == 12 else date(d.year, d.month + 1, 1)
