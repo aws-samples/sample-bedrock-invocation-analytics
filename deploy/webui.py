@@ -20,6 +20,7 @@ from aws_cdk import (
     aws_elasticloadbalancingv2 as elbv2,
     aws_elasticloadbalancingv2_targets as targets,
     aws_iam as iam,
+    aws_lambda as _lambda,
     custom_resources as cr,
 )
 from constructs import Construct
@@ -33,6 +34,8 @@ ADMIN_GROUP_DESCRIPTION = "Bedrock Invocation Analytics: edit pricing"
 # as "all mutable attributes" (custom ones included). The WebUI writes none; Cognito requires required attributes
 # (email) to stay writable, so that is the narrowest list it accepts.
 CLIENT_WRITE_ATTRIBUTES = ["email"]
+# Attributes the WebUI may write on the reprice job item (same list as webui/api/store.py).
+REPRICE_WEBUI_ATTRIBUTES = ("PK", "SK", "job_id", "status", "start", "dry_run", "started_by", "created_at")
 
 
 @dataclass
@@ -52,7 +55,8 @@ class WebUiConfig:
 
 class WebUi(Construct):
     def __init__(self, scope: Construct, id: str, *, config: WebUiConfig,
-                 usage_table: dynamodb.ITable, pricing_table: dynamodb.ITable, data_sources: dict[str, str]):
+                 usage_table: dynamodb.ITable, pricing_table: dynamodb.ITable, data_sources: dict[str, str],
+                 reprice_tick_fn: _lambda.IFunction):
         super().__init__(scope, id)
         stack = Stack.of(self)
         if not LAMBDA_PACKAGE.is_dir():
@@ -68,6 +72,7 @@ class WebUi(Construct):
                 "ADMIN_GROUP": config.admin_group or DEFAULT_ADMIN_GROUP,
                 "USAGE_STATS_TABLE": usage_table.table_name,
                 "MODEL_PRICING_TABLE": pricing_table.table_name,
+                "REPRICE_TICK_FUNCTION": reprice_tick_fn.function_name,
                 "ACCOUNT_NAMES": json.dumps(config.account_names),
                 # Shown in the SPA info panel: where the dashboard reads from and where to run ad-hoc queries.
                 "DATA_SOURCES": stack.to_json_string({"region": stack.region, "usage_table": usage_table.table_name,
@@ -78,6 +83,12 @@ class WebUi(Construct):
         usage_table.grant_read_data(fn)
         pricing_table.grant_read_write_data(fn)
         fn.add_to_role_policy(iam.PolicyStatement(actions=["cloudwatch:GetMetricData"], resources=["*"]))
+        # Reprice jobs: write only PK=REPRICE and only the request attributes; the worker owns everything else.
+        fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["dynamodb:PutItem", "dynamodb:UpdateItem"], resources=[usage_table.table_arn],
+            conditions={"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["REPRICE"],
+                                                      "dynamodb:Attributes": list(REPRICE_WEBUI_ATTRIBUTES)}}))
+        reprice_tick_fn.grant_invoke(fn)
         fn.add_to_role_policy(iam.PolicyStatement(actions=["cognito-idp:AdminGetUser"], resources=[pool_arn]))
 
         vpc, subnets = self._network(config)

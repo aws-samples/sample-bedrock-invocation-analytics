@@ -57,6 +57,8 @@ USAGE_EVENTS_SCHEMA = [
 ]
 
 
+SETTLE_MINUTE = 20  # minute past each hour when settle runs; reprice chunks keep clear of it
+
 class HubStack(Stack):
 
     def __init__(self, scope: Construct, id: str, *, cost_agg_interval_min: int = 5,
@@ -138,21 +140,28 @@ class HubStack(Stack):
                 bytes_scanned_cutoff_per_query=10 * 1024 ** 3,
             ),
         )
-        # Failed async invocations (incremental, settle) land here; both resume on the next run. Purge after review.
+        # Failed async invocations (incremental incl. reprice chunks, settle) land here; all resume on the next run.
+        # Purge after review.
         compute_failures = common.dead_letter_queue(self, "ComputeCostFailures", f"{id}-compute-cost-failures")
         compute_cost_fn = common.python_function(self, "ComputeCostFunction",
             function_name=f"{id}-compute-cost", handler="compute_cost.handler", timeout_s=600, memory_mb=1024,
             retry_attempts=0, on_failure=lambda_destinations.SqsDestination(compute_failures),
-            environment={
+            environment=(compute_env := {
                 "STACK_NAME": id,
+                "SETTLE_MINUTE": str(SETTLE_MINUTE),
                 "USAGE_STATS_TABLE": usage_stats_table.table_name,
                 "MODEL_PRICING_TABLE": model_pricing_table.table_name,
                 "ATHENA_WORKGROUP": workgroup.name,
                 "ICEBERG_CATALOG": f"s3tablescatalog/{catalog['bucket_name']}",
                 "ICEBERG_DATABASE": ICEBERG_NAMESPACE,
                 "ICEBERG_TABLE": ICEBERG_TABLE,
-            },
+            }),
         )
+        # The WebUI invokes this to start a reprice job now: one incremental run whatever the payload. No retries and no
+        # failure destination (errors are in the job record and its own alarm); the L2 lease serializes the runs.
+        reprice_tick_fn = common.python_function(self, "RepriceTickFunction",
+            function_name=f"{id}-compute-cost-tick", handler="compute_cost.tick_handler", timeout_s=600, memory_mb=1024,
+            role=compute_cost_fn.role, retry_attempts=0, max_event_age=Duration.seconds(60), environment=compute_env)
         usage_stats_table.grant_read_write_data(compute_cost_fn)
         model_pricing_table.grant_read_data(compute_cost_fn)
         self._grant_athena_read(compute_cost_fn, workgroup, ops_bucket, catalog)
@@ -164,7 +173,7 @@ class HubStack(Stack):
 
         # Settle: recompute dirty and recently completed days (HOURLY + DAILY) and completed months from Iceberg.
         events.Rule(self, "SettleSchedule", rule_name=f"{id}-settle",
-            schedule=events.Schedule.cron(minute="20"),
+            schedule=events.Schedule.cron(minute=str(SETTLE_MINUTE)),
             targets=[targets.LambdaFunction(compute_cost_fn, event=events.RuleTargetInput.from_object({"settle": {}}))])
 
         # ── Pricing sync ──
@@ -193,7 +202,8 @@ class HubStack(Stack):
             CfnOutput(self, "SpokeWriteRoleArn", value=spoke_role.role_arn)
 
         # ── Alarms ──
-        for name, fn in (("ParseLog", parse_log_fn), ("ComputeCost", compute_cost_fn), ("SyncPricing", sync_pricing_fn)):
+        for name, fn in (("ParseLog", parse_log_fn), ("ComputeCost", compute_cost_fn), ("RepriceTick", reprice_tick_fn),
+                         ("SyncPricing", sync_pricing_fn)):
             alarms.function_errors(f"{name}ErrorsAlarm", fn)
         alarms.dlq_depth("ParseLogDLQAlarm", parse_dlq)
         firehose_metric = lambda name, stat: cw.Metric(  # noqa: E731
@@ -219,6 +229,7 @@ class HubStack(Stack):
 
         if webui:
             WebUi(self, "WebUi", config=webui, usage_table=usage_stats_table, pricing_table=model_pricing_table,
+                  reprice_tick_fn=reprice_tick_fn,
                   data_sources={"athena_workgroup": workgroup.name,
                                 "iceberg_table": f"\"s3tablescatalog/{catalog['bucket_name']}\".{ICEBERG_NAMESPACE}.{ICEBERG_TABLE}"})
 

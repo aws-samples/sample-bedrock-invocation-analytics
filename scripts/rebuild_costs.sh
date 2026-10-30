@@ -50,5 +50,5 @@ PY
         exit 1
     fi
     RESUME="$next"
-    $DRY || invoke '{}' >/dev/null || true   # let incremental L2 run between months
+    $DRY || invoke '{"incremental_only": true}' >/dev/null || true   # let incremental L2 run between months
 done

@@ -8,10 +8,12 @@ Every write recomputes complete HOURLY / DAILY / MONTHLY rows from the deduplica
 that period. Rerunning any step is harmless. All writers hold the lease lock META/L2#lock.
 
 Entry points (event payload):
-  {}                                    incremental: hours touched by newly ingested events (every few minutes)
+  {}                                    incremental: hours touched by newly ingested events (every few minutes),
+                                        then one reprice chunk; {"incremental_only": true} skips the chunk
   {"settle": {}}                        dirty days, the last 2 completed days, catch-up after SETTLED (hourly)
   {"rebuild": {"start", "end", "dry_run", "resume"}}  explicit range, resumable per month; returns
                                         {"next": first day of the month to resume at} until done
+The scheduled incremental run also advances a WebUI reprice job by one chunk (reprice.py).
 """
 
 import csv
@@ -126,7 +128,11 @@ def handler(event, context):
             with Lease(context, wait_s=LOCK_WAIT_S):
                 return run_settle(now, context)
         with Lease(context, wait_s=0):
-            return run_incremental(now, context)
+            result = run_incremental(now, context)
+            if not event.get("incremental_only"):  # rebuild_costs.sh between months: keep its own pace
+                import reprice  # noqa: PLC0415  (reprice imports this module)
+                result["reprice"] = reprice.run_chunk(context)  # raises only after the incremental work is committed
+            return result
     except LockBusy:
         emit(now, {"LockBusy": 1})
         if "rebuild" in event:
@@ -135,6 +141,11 @@ def handler(event, context):
             emit(now, {"SettleLagHours": max((hours_since_settled(pk, now) for pk in list_accounts()), default=0)})
         print("Lock busy; skipping this run")
         return {"skipped": "lock busy"}
+
+
+def tick_handler(event, context):
+    """WebUI-invokable entry point: always one incremental run (plus a reprice chunk); the payload is ignored."""
+    return handler({}, context)
 
 
 # ── Incremental ──
@@ -212,9 +223,7 @@ def run_rebuild(spec: dict, now: datetime, context):
     resume = date.fromisoformat(spec["resume"]) if spec.get("resume") else requested
     end = min(date.fromisoformat(spec["end"]) if spec.get("end") else yesterday, yesterday)
     if spec.get("start") == "all" and not spec.get("resume") and not spec.get("dry_run"):
-        for item in meta_items("UNPRICED#"):  # markers from before event-time spans; the full rebuild re-marks
-            if not item.get("first_seen"):
-                boto3.resource("dynamodb").Table(USAGE_STATS_TABLE).delete_item(Key={"PK": "META", "SK": item["SK"]})
+        clear_legacy_unpriced()
     days = {}
     for pk, first in first_full.items():
         start = max(requested, first, resume)
@@ -238,9 +247,8 @@ def settle_days(days: dict[str, set[date]], now: datetime, context, dry_run: boo
     totals = {"days": 0, "puts": 0, "deletes": 0, "unpriced_events": 0, "scanned_bytes": 0, "diffs": []}
     for (y, m) in sorted(by_month):
         month_start = date(y, m, 1)
-        resume = {**totals, "diffs": trim_diffs(totals["diffs"]), "next": month_start.isoformat()}
         if remaining_s(context) < MONTH_MARGIN_S:
-            return resume
+            return settle_result(totals, month_start)
         month_end = next_month(month_start)
         complete = month_end <= now.date()
         wanted = by_month[(y, m)]
@@ -254,7 +262,7 @@ def settle_days(days: dict[str, set[date]], now: datetime, context, dry_run: boo
         for pk in sorted(wanted):
             for d in sorted(wanted[pk]):
                 if remaining_s(context) < STOP_MARGIN_S:
-                    return resume  # the month is redone next time; writes are diffs, so this is cheap
+                    return settle_result(totals, month_start)  # redone next time; writes are diffs, so cheap
                 write_day(pk, d, hourly, daily, now, dry_run, totals)
                 if dry_run:
                     continue
@@ -279,12 +287,14 @@ def settle_days(days: dict[str, set[date]], now: datetime, context, dry_run: boo
                     delete_marker(pk, d, marker_at)
         if not dry_run:
             scope_days = {q_start + timedelta(days=n) for n in range((q_end - q_start).days)} - {now.date()}
-            fully_rewritten = all(scope_days <= wanted.get(pk, set()) for pk in set(wanted) | set(hourly))
+            # days before a pk's first full Iceberg day predate the table and are never rewritten
+            fully_rewritten = all({d for d in scope_days if not first_full or d >= first_full.get(pk, d)} <= wanted.get(pk, set())
+                                  for pk in set(wanted) | set(hourly))
             if fully_rewritten:
                 update_unpriced(unpriced, day_start(q_start), day_start(q_end), now)
             else:
                 mark_unpriced(unpriced, now)  # only part of the scope was rewritten; never clear here
-    return {**totals, "diffs": trim_diffs(totals["diffs"]), "next": None}
+    return settle_result(totals, None)
 
 
 def write_day(pk: str, d: date, hourly: dict, daily: dict, now: datetime, dry_run: bool, totals: dict):
@@ -304,14 +314,26 @@ def write_day(pk: str, d: date, hourly: dict, daily: dict, now: datetime, dry_ru
     totals["days"] += 1
 
 
-def trim_diffs(diffs: list[dict], limit: int = 200) -> list[dict]:
-    """All periods whose invocations would drop, then the first other changes up to `limit`."""
-    drops = [d for d in diffs if d["drop"]]
-    return drops + [d for d in diffs if not d["drop"]][:max(limit - len(drops), 0)]
+def trim_diffs(diffs: list[dict], limit: int = 300) -> list[dict]:
+    """Periods whose invocations would drop first, then the largest cost changes; at most `limit` entries."""
+    drops = [d for d in diffs if d["drop"]][:limit]
+    others = sorted((d for d in diffs if not d["drop"]),
+                    key=lambda d: -abs(int(d.get("cost_after", 0)) - int(d.get("cost_before", 0))))
+    return drops + others[:limit - len(drops)]
 
 
-def recompute_hours(hours: set[tuple[str, datetime]], now: datetime, context, dry_run: bool) -> dict:
-    """Recompute the given (pk, hour) HOURLY rows; hours are grouped into one query per month."""
+def settle_result(totals: dict, next_month_start: date | None) -> dict:
+    diffs = totals["diffs"]
+    return {**totals, "diffs": trim_diffs(diffs), "next": next_month_start.isoformat() if next_month_start else None,
+            "drops": sum(1 for d in diffs if d["drop"]),
+            "days_changed": sum(1 for d in diffs if len(d["period"]) == 10),
+            "months_changed": sum(1 for d in diffs if len(d["period"]) == 7)}
+
+
+def recompute_hours(hours: set[tuple[str, datetime]], now: datetime, context, dry_run: bool,
+                    clear_unpriced: bool = False) -> dict:
+    """Recompute the given (pk, hour) HOURLY rows; hours are grouped into one query per month.
+    clear_unpriced: the hours cover every pk over [first, last hour] of each month, so markers inside that span clear."""
     stats = {"puts": 0, "deletes": 0, "unpriced_events": 0, "scanned_bytes": 0}
     by_month = defaultdict(set)
     for pk, h in hours:
@@ -329,7 +351,11 @@ def recompute_hours(hours: set[tuple[str, datetime]], now: datetime, context, dr
             rows = {sk: v for sk, v in hourly.get(pk, {}).items() if sk.split("#")[1] == label}
             p, d = replace_scope(pk, f"HOURLY#{label}#", rows, ttl=int((h + HOURLY_TTL).timestamp()), dry_run=dry_run)
             stats["puts"] += p; stats["deletes"] += d
-        if not dry_run:
+        if dry_run:
+            continue
+        if clear_unpriced:
+            update_unpriced(unpriced, lo, hi, now)
+        else:
             mark_unpriced(unpriced, now)
     return stats
 
@@ -451,7 +477,9 @@ def replace_scope(pk: str, prefix: str, rows: dict[str, dict], ttl: int | None, 
     if diffs is not None and (puts or deletes) and prefix.startswith(("DAILY#", "MONTHLY#")):
         old = int((existing.get(prefix + "TOTAL") or {}).get("invocations", 0))
         new = int((rows.get(prefix + "TOTAL") or {}).get("invocations", 0))
+        cost = lambda rows: int((rows.get(prefix + "TOTAL") or {}).get("cost_micro_usd", 0))  # noqa: E731
         diffs.append({"pk": pk, "period": prefix.split("#")[1], "invocations_before": old, "invocations_after": new,
+                      "cost_before": cost(existing), "cost_after": cost(rows),
                       "puts": len(puts), "deletes": len(deletes), "drop": new < old})
     if dry_run:
         return len(puts), len(deletes)
@@ -587,6 +615,13 @@ def mark_unpriced(unpriced: dict[str, dict], now: datetime):
         last = max(filter(None, (parse_iso(current.get("last_seen")), span["last"])))
         table.put_item(Item={"PK": "META", "SK": f"UNPRICED#{model}", "first_seen": first.isoformat(),
                              "last_seen": last.isoformat(), "updated_at": now.isoformat()})
+
+
+def clear_legacy_unpriced():
+    """Markers from before event-time spans can't be cleared by span; a full rebuild re-marks what is still unpriced."""
+    for item in meta_items("UNPRICED#"):
+        if not item.get("first_seen"):
+            boto3.resource("dynamodb").Table(USAGE_STATS_TABLE).delete_item(Key={"PK": "META", "SK": item["SK"]})
 
 
 def update_unpriced(unpriced: dict[str, dict], scope_from: datetime, scope_to: datetime, now: datetime):

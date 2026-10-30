@@ -4,12 +4,17 @@
 
 import json
 import os
+import uuid
 from datetime import datetime, timedelta, timezone, tzinfo
 
 import boto3
+from botocore.config import Config
 from boto3.dynamodb.conditions import Key
 
 USAGE_TABLE = os.environ.get("USAGE_STATS_TABLE", "BedrockInvocationAnalytics-usage-stats")
+REPRICE_TICK_FUNCTION = os.environ.get("REPRICE_TICK_FUNCTION", "")
+REPRICE_KEY = {"PK": "REPRICE", "SK": "latest"}  # the WebUI role may write only this item and only these attributes:
+REPRICE_WEBUI_ATTRIBUTES = ("PK", "SK", "job_id", "status", "start", "dry_run", "started_by", "created_at")
 PRICING_TABLE = os.environ.get("MODEL_PRICING_TABLE", "BedrockInvocationAnalytics-model-pricing")
 
 _clients: dict = {}
@@ -25,6 +30,12 @@ def _pricing():
     if "pricing" not in _clients:
         _clients["pricing"] = boto3.resource("dynamodb").Table(PRICING_TABLE)
     return _clients["pricing"]
+
+
+def _lambda():
+    if "lambda" not in _clients:
+        _clients["lambda"] = boto3.client("lambda", config=Config(connect_timeout=3, read_timeout=5, retries={"max_attempts": 1}))
+    return _clients["lambda"]
 
 
 def _cw():
@@ -473,3 +484,50 @@ def _format_item(item: dict) -> dict:
         "tpot_min": round(int(item.get("tpot_min", 0)) / 1000, 2),
         "tpot_max": round(int(item.get("tpot_max", 0)) / 1000, 2),
     }
+
+
+# ── Reprice jobs (worker: compute_cost / reprice.py) ──
+
+def get_reprice_job() -> dict | None:
+    return _usage().get_item(Key=REPRICE_KEY, ConsistentRead=True).get("Item")
+
+
+def create_reprice_job(start: str, dry_run: bool, started_by: str) -> tuple[dict | None, bool]:
+    """Queue a job unless one is active. Returns (job, created); on conflict the active job."""
+    job = {**REPRICE_KEY, "job_id": str(uuid.uuid4()), "status": "queued", "start": start, "dry_run": dry_run,
+           "started_by": started_by, "created_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        _usage().put_item(Item=job, ConditionExpression="attribute_not_exists(PK) OR #s IN (:d, :f, :c)",
+                          ExpressionAttributeNames={"#s": "status"},
+                          ExpressionAttributeValues={":d": "done", ":f": "failed", ":c": "cancelled"})
+    except _usage().meta.client.exceptions.ConditionalCheckFailedException:
+        return get_reprice_job(), False
+    return job, True
+
+
+def cancel_reprice_job(job_id: str) -> dict | None:
+    """queued → cancelled, running → cancelling (the worker finishes the month in progress). None if no such job."""
+    job = get_reprice_job()
+    if not job or job.get("job_id") != job_id:
+        return None
+    target = {"queued": "cancelled", "running": "cancelling"}.get(job.get("status"))
+    if target:
+        try:
+            _usage().update_item(Key=REPRICE_KEY, UpdateExpression="SET #s = :t",
+                                 ConditionExpression="job_id = :j AND #s = :seen", ExpressionAttributeNames={"#s": "status"},
+                                 ExpressionAttributeValues={":t": target, ":j": job_id, ":seen": job["status"]})
+        except _usage().meta.client.exceptions.ConditionalCheckFailedException:
+            moved = get_reprice_job() or {}
+            if job["status"] == "queued" and moved.get("job_id") == job_id and moved.get("status") == "running":
+                return cancel_reprice_job(job_id)  # the worker picked it up in between
+    return get_reprice_job()
+
+
+def kick_reprice():
+    """Start the worker now instead of at the next schedule; failure only delays the job."""
+    if not REPRICE_TICK_FUNCTION:
+        return
+    try:
+        _lambda().invoke(FunctionName=REPRICE_TICK_FUNCTION, InvocationType="Event", Payload=b"{}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Failed to invoke {REPRICE_TICK_FUNCTION}: {e}")

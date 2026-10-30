@@ -66,8 +66,43 @@ export interface TtftPoint {
   ttft_p99: number
 }
 
+export type RepriceStatus = 'queued' | 'running' | 'cancelling' | 'done' | 'failed' | 'cancelled'
+
+export interface RepriceDiff {
+  pk: string
+  period: string
+  invocations_before: number
+  invocations_after: number
+  cost_before: number
+  cost_after: number
+  drop: boolean
+}
+
+export interface RepriceJob {
+  job_id: string
+  status: RepriceStatus
+  start: string
+  dry_run: boolean
+  created_at: string
+  started_at?: string
+  updated_at?: string
+  finished_at?: string
+  next?: string
+  months_done?: number
+  months_total?: number
+  today_done?: boolean
+  stalls?: number
+  totals?: { days: number; puts: number; deletes: number; drops: number; days_changed: number; months_changed: number }
+  started_by?: string
+  diffs?: RepriceDiff[]
+  error?: string
+}
+
+export const REPRICE_ACTIVE: RepriceStatus[] = ['queued', 'running', 'cancelling']
+
 export interface Status {
   data_up_to: string | null
+  reprice: Pick<RepriceJob, 'job_id' | 'status' | 'dry_run' | 'months_done' | 'months_total' | 'today_done'> | null
   unpriced_models: string[]
   pricing_sync: { synced_at?: string; models_updated?: number; models_added?: number; models_skipped?: number } | null
   user: { username: string; email: string; is_admin: boolean }
@@ -87,10 +122,12 @@ export type PricingRecord = Record<PriceField, number> & {
 
 export class ApiError extends Error {
   readonly status: number
+  readonly body: unknown
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, body?: unknown) {
     super(message)
     this.status = status
+    this.body = body
   }
 }
 
@@ -103,7 +140,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   })
   if (!resp.ok) {
     const body = await resp.json().catch(() => ({}))
-    throw new ApiError(resp.status, (body as { error?: string }).error ?? `HTTP ${resp.status}`)
+    throw new ApiError(resp.status, (body as { error?: string }).error ?? `HTTP ${resp.status}`, body)
   }
   return (resp.status === 204 ? undefined : await resp.json()) as T
 }
@@ -134,6 +171,11 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ ...prices, effective_date: effectiveDate }),
     }),
+  reprice: () => request<{ job: RepriceJob | null }>('/api/reprice').then((r) => r.job),
+  startReprice: (start: string, dryRun: boolean) =>
+    request<{ job: RepriceJob }>('/api/reprice', { method: 'POST', body: JSON.stringify({ start, dry_run: dryRun }) }).then((r) => r.job),
+  cancelReprice: (jobId: string) =>
+    request<{ job: RepriceJob }>(`/api/reprice?${qs({ job_id: jobId })}`, { method: 'DELETE' }).then((r) => r.job),
   deletePricing: (model: string, effectiveDate: string) =>
     request<void>(`/api/pricing/${encodeURIComponent(model)}?${qs({ effective_date: effectiveDate })}`, { method: 'DELETE' }),
 }

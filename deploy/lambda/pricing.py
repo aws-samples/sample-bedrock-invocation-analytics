@@ -43,7 +43,7 @@ def versions_from_items(items: list[dict]) -> list[PriceVersion]:
 def load_versions(pricing_table, models: set[str]) -> dict[str, list[PriceVersion]]:
     out = {}
     for model in sorted(models):
-        kwargs = {"KeyConditionExpression": Key("PK").eq(f"MODEL#{model}")}
+        kwargs = {"KeyConditionExpression": Key("PK").eq(f"MODEL#{model}"), "ConsistentRead": True}  # a price saved just before a reprice applies
         items = []
         while True:
             resp = pricing_table.query(**kwargs)

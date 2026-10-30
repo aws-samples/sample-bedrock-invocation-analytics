@@ -215,3 +215,73 @@ def test_encoded_offset_and_caller_dimension_are_decoded(api):
     status, _, _ = call("/api/trend", query={"start": "2026-10-21T00:00:00+08:00", "end": "2026-10-28T00:00:00+08:00",
                                              "account": "111122223333#us-west-2", "dim": "CALLER#role/My Session"})
     assert status == 200 and seen == {"start": "2026-10-21T00:00:00+08:00", "dim": "CALLER#role/My Session"}
+
+
+# ── reprice ──
+
+@pytest.fixture
+def reprice_api(api):
+    from moto import mock_aws
+    import boto3
+    with mock_aws():
+        boto3.client("dynamodb", region_name="us-west-2").create_table(
+            TableName="usage-test", BillingMode="PAY_PER_REQUEST",
+            KeySchema=[{"AttributeName": "PK", "KeyType": "HASH"}, {"AttributeName": "SK", "KeyType": "RANGE"}],
+            AttributeDefinitions=[{"AttributeName": "PK", "AttributeType": "S"}, {"AttributeName": "SK", "AttributeType": "S"}])
+        api.setattr(store, "USAGE_TABLE", "usage-test")
+        api.setattr(store, "_clients", {})
+        kicks = []
+        api.setattr(store, "kick_reprice", lambda: kicks.append(1))
+        yield kicks
+
+
+def test_reprice_start_validates_and_allows_one_active_job(reprice_api):
+    assert call("/api/reprice", "POST", body={"start": "all"})[0] == 403  # viewers can't
+    for bad in ({"start": "2026-02-30"}, {"start": "yesterday"}, {"start": "all", "dry_run": "true"},
+                {"start": "all", "extra": 1}, {"start": "2999-01-01"}):
+        assert call("/api/reprice", "POST", groups=[ADMIN], body=bad)[0] == 400, bad
+    status, _, body = call("/api/reprice", "POST", groups=[ADMIN], body={"start": "2026-09-17", "dry_run": True})
+    job = json.loads(body)["job"]
+    assert status == 202 and job["status"] == "queued" and job["dry_run"] is True and job["started_by"].endswith("@example.com")
+    assert reprice_api == [1]
+    assert set(store.get_reprice_job()) <= set(store.REPRICE_WEBUI_ATTRIBUTES)
+    status, _, body = call("/api/reprice", "POST", groups=[ADMIN], body={"start": "all"})
+    assert status == 409 and json.loads(body)["job"]["job_id"] == job["job_id"]
+
+
+def test_reprice_view_hides_admin_fields_from_viewers(reprice_api):
+    call("/api/reprice", "POST", groups=[ADMIN], body={"start": "all"})
+    store._usage().update_item(Key=store.REPRICE_KEY, UpdateExpression="SET diffs = :d, first_full = :f",
+                               ExpressionAttributeValues={":d": [], ":f": {}})
+    viewer = json.loads(call("/api/reprice")[2])["job"]
+    admin = json.loads(call("/api/reprice", groups=[ADMIN])[2])["job"]
+    assert "started_by" not in viewer and "diffs" not in viewer and "first_full" not in viewer and "PK" not in viewer
+    assert "started_by" in admin and "diffs" in admin and "first_full" not in admin
+    assert json.loads(call("/api/status")[2])["reprice"]["status"] == "queued"
+
+
+def test_reprice_cancel_transitions(reprice_api):
+    job_id = json.loads(call("/api/reprice", "POST", groups=[ADMIN], body={"start": "all"})[2])["job"]["job_id"]
+    assert call("/api/reprice", "DELETE", query={"job_id": job_id})[0] == 403
+    assert call("/api/reprice", "DELETE", groups=[ADMIN], query={"job_id": "nope"})[0] == 400
+    assert call("/api/reprice", "DELETE", groups=[ADMIN], query={"job_id": "00000000-0000-4000-8000-000000000009"})[0] == 404
+    status, _, body = call("/api/reprice", "DELETE", groups=[ADMIN], query={"job_id": job_id})
+    assert status == 200 and json.loads(body)["job"]["status"] == "cancelled"
+    call("/api/reprice", "POST", groups=[ADMIN], body={"start": "all"})  # a finished job can be replaced
+    running = store.get_reprice_job()
+    store._usage().update_item(Key=store.REPRICE_KEY, UpdateExpression="SET #s = :r", ExpressionAttributeNames={"#s": "status"},
+                               ExpressionAttributeValues={":r": "running"})
+    body = call("/api/reprice", "DELETE", groups=[ADMIN], query={"job_id": running["job_id"]})[2]
+    assert json.loads(body)["job"]["status"] == "cancelling"
+
+
+def test_reprice_start_returns_202_when_kick_fails(reprice_api):
+    def boom(**kw):
+        raise RuntimeError("endpoint unreachable")
+    store._clients["lambda"] = type("L", (), {"invoke": staticmethod(boom)})()
+    store.REPRICE_TICK_FUNCTION = "tick"
+    try:
+        store.kick_reprice()  # logs a warning instead of raising
+    finally:
+        store.REPRICE_TICK_FUNCTION = ""
+    assert call("/api/reprice", "POST", groups=[ADMIN], body={"start": "all"})[0] == 202

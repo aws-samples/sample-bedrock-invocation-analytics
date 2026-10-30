@@ -16,6 +16,7 @@ import StatusIndicator from '@cloudscape-design/components/status-indicator'
 import Table, { type TableProps } from '@cloudscape-design/components/table'
 import TextFilter from '@cloudscape-design/components/text-filter'
 import { api, PRICE_FIELDS, type PriceField, type PricingRecord, type Status } from '../api'
+import RepriceModal from '../components/RepriceModal'
 
 const LABELS: Record<PriceField, string> = {
   input_per_1k: 'Input $/1K tokens',
@@ -56,6 +57,8 @@ export default function Pricing({ status }: { status?: Status }) {
   const history = useQuery({ queryKey: ['pricing', historyModel], queryFn: () => api.pricingHistory(historyModel!), enabled: !!historyModel })
   const [draft, setDraft] = useState<Draft | null>(null)
   const [toDelete, setToDelete] = useState<PricingRecord | null>(null)
+  const [reprice, setReprice] = useState<{ start?: string } | null>(null)
+  const [saved, setSaved] = useState<{ model: string; day: string } | null>(null)
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ['pricing'] })
   const save = useMutation({
@@ -64,7 +67,13 @@ export default function Pricing({ status }: { status?: Status }) {
       await api.savePricing(d.model, prices, d.effectiveDate)
       if (d.originalDate && d.originalDate !== d.effectiveDate) await api.deletePricing(d.model, d.originalDate)
     },
-    onSuccess: () => { setDraft(null); invalidate() },
+    onSuccess: (_r, d) => {
+      setDraft(null)
+      invalidate()
+      // Costs change from the earlier of the old and new effective dates (UTC); future prices need no reprice.
+      const from = Math.min(Date.parse(d.effectiveDate), d.originalDate ? Date.parse(d.originalDate) : Infinity)
+      setSaved(from <= Date.now() ? { model: d.model, day: new Date(from).toISOString().slice(0, 10) } : null)
+    },
   })
   const remove = useMutation({
     mutationFn: (r: PricingRecord) => api.deletePricing(r.model_id, r.effective_date),
@@ -98,6 +107,12 @@ export default function Pricing({ status }: { status?: Status }) {
       </Header>
     }>
       <SpaceBetween size="l">
+        {saved && (
+          <Alert type="success" dismissible onDismiss={() => setSaved(null)}
+            action={<Button onClick={() => setReprice({ start: saved.day })}>Reprice usage</Button>}>
+            Saved the {saved.model} price. Past usage keeps its previous cost until you reprice it from {saved.day}.
+          </Alert>
+        )}
         {!isAdmin && <Alert type="info">You have read-only access. Members of the {status?.admin_group ?? 'admin'} group can edit prices.</Alert>}
         <Table
           {...collectionProps}
@@ -107,7 +122,12 @@ export default function Pricing({ status }: { status?: Status }) {
           loadingText="Loading prices"
           stickyHeader
           header={<Header counter={`(${pricing.data?.length ?? 0})`}
-            actions={isAdmin && <Button onClick={() => setDraft(emptyDraft())}>Add model price</Button>}>Models</Header>}
+            actions={isAdmin && (
+              <SpaceBetween direction="horizontal" size="xs">
+                <Button onClick={() => setReprice({})}>Reprice usage</Button>
+                <Button onClick={() => setDraft(emptyDraft())}>Add model price</Button>
+              </SpaceBetween>
+            )}>Models</Header>}
           filter={<TextFilter {...filterProps} filteringPlaceholder="Find model" countText={`${filteredItemsCount ?? 0} matches`} />}
           pagination={<Pagination {...paginationProps} />}
           empty={<Box textAlign="center">No prices</Box>}
@@ -158,7 +178,7 @@ export default function Pricing({ status }: { status?: Status }) {
                 <FormField label="Effective date (UTC, ISO 8601)">
                   <Input value={draft.effectiveDate} onChange={(e) => setDraft({ ...draft, effectiveDate: e.detail.value })} />
                 </FormField>
-                <StatusIndicator type="info">After saving, run scripts/rebuild_costs.sh to reprice past usage.</StatusIndicator>
+                <StatusIndicator type="info">Past usage keeps its previous cost until you reprice it.</StatusIndicator>
               </SpaceBetween>
             </Form>
           </form>
@@ -177,6 +197,7 @@ export default function Pricing({ status }: { status?: Status }) {
         {toDelete && `Delete the ${toDelete.model_id} price effective ${toDelete.effective_date}?`}
         {remove.error && <Alert type="error">{remove.error.message}</Alert>}
       </Modal>
+      {isAdmin && reprice && <RepriceModal initialStart={reprice.start} onDismiss={() => setReprice(null)} />}
     </ContentLayout>
   )
 }

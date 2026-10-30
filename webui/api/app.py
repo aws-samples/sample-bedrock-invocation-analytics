@@ -32,6 +32,10 @@ MAX_PRICE = 1000.0
 
 ACCOUNT_RE = re.compile(r"^\d{12}#[a-z0-9-]{1,32}$")
 MODEL_RE = re.compile(r"^[\w.:/@+-]{1,256}$")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+REPRICE_START_RE = re.compile(r"^(all|\d{4}-\d{2}-\d{2})$")
+REPRICE_ADMIN_FIELDS = ("started_by", "diffs", "error")
+REPRICE_INTERNAL_FIELDS = ("PK", "SK", "first_full", "inflight_next")
 DIM_RE = re.compile(r"^(TOTAL|MODEL#[\w.:/@+-]{1,256}|CALLER#[^\x00-\x1f]{1,512})$")
 COMPRESSIBLE = ("text/", "application/javascript", "application/json", "image/svg+xml")
 # ALB caps Lambda responses at 1 MB (base64 body included); files above this are gzipped even without Accept-Encoding.
@@ -189,6 +193,7 @@ def status():
         "pricing_sync": store.get_pricing_sync_info(),
         "user": {"username": user.username, "email": user_email(user.username), "is_admin": user.is_admin},
         "admin_group": ADMIN_GROUP,
+        "reprice": reprice_summary(store.get_reprice_job()),
         "data_sources": json.loads(os.environ.get("DATA_SOURCES") or "{}"),
     }
 
@@ -208,12 +213,7 @@ def pricing_history(model: str):
 @app.put("/api/pricing/<model>")
 def pricing_save(model: str):
     user = current_user(admin=True)
-    try:
-        body = app.current_event.json_body or {}
-    except json.JSONDecodeError as e:
-        raise BadRequest("Body must be JSON") from e
-    if not isinstance(body, dict):
-        raise BadRequest("Body must be a JSON object")
+    body = json_object()
     effective_date = parse_time("effective_date", str(body.get("effective_date", "")))
     effective = effective_date.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
     store.save_pricing(parse_model(model), parse_prices(body), effective, updated_by=user_email(user.username))
@@ -226,6 +226,77 @@ def pricing_delete(model: str):
     effective = parse_time("effective_date", query_param("effective_date"))
     store.delete_pricing(parse_model(model), effective.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ"))
     return Response(status_code=204, body="")
+
+
+@app.get("/api/reprice")
+def reprice_get():
+    user = current_user()
+    return {"job": reprice_view(store.get_reprice_job(), user.is_admin)}
+
+
+@app.post("/api/reprice")
+def reprice_start():
+    user = current_user(admin=True)
+    body = json_object()
+    if set(body) - {"start", "dry_run"}:
+        raise BadRequest("Only start and dry_run are accepted")
+    start = body.get("start")
+    if not isinstance(start, str) or not REPRICE_START_RE.match(start):
+        raise BadRequest("start must be 'all' or YYYY-MM-DD")
+    if start != "all":
+        try:
+            day = datetime.strptime(start, "%Y-%m-%d").date()
+        except ValueError as e:
+            raise BadRequest("start must be a valid date") from e
+        if day > datetime.now(ZoneInfo("UTC")).date():
+            raise BadRequest("start must not be in the future")
+    dry_run = body.get("dry_run", False)
+    if not isinstance(dry_run, bool):
+        raise BadRequest("dry_run must be true or false")
+    job, created = store.create_reprice_job(start, dry_run, user_email(user.username)[:256])
+    if not created:
+        return Response(status_code=409, content_type="application/json", headers=SECURITY_HEADERS,
+                        body=json.dumps({"error": "A reprice job is already active", "job": reprice_view(job, True)},
+                                        default=_json_default))
+    store.kick_reprice()
+    return Response(status_code=202, content_type="application/json", headers=SECURITY_HEADERS,
+                    body=json.dumps({"job": reprice_view(job, True)}, default=_json_default))
+
+
+@app.delete("/api/reprice")
+def reprice_cancel():
+    current_user(admin=True)
+    job_id = query_param("job_id")
+    if not UUID_RE.match(job_id):
+        raise BadRequest("Invalid job_id")
+    job = store.cancel_reprice_job(job_id)
+    if job is None:
+        return json_error(404, "No such job")
+    store.kick_reprice()
+    return {"job": reprice_view(job, True)}
+
+
+def reprice_view(job: dict | None, admin: bool) -> dict | None:
+    if not job:
+        return None
+    hidden = REPRICE_INTERNAL_FIELDS + (() if admin else REPRICE_ADMIN_FIELDS)
+    return {k: v for k, v in job.items() if k not in hidden}
+
+
+def reprice_summary(job: dict | None) -> dict | None:
+    if not job:
+        return None
+    return {k: job.get(k) for k in ("job_id", "status", "dry_run", "months_done", "months_total", "today_done")}
+
+
+def json_object() -> dict:
+    try:
+        body = app.current_event.json_body or {}
+    except json.JSONDecodeError as e:
+        raise BadRequest("Body must be JSON") from e
+    if not isinstance(body, dict):
+        raise BadRequest("Body must be a JSON object")
+    return body
 
 
 # ── SPA ──

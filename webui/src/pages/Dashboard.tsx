@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { useNavigate } from 'react-router'
 import Alert from '@cloudscape-design/components/alert'
 import Box from '@cloudscape-design/components/box'
 import Button from '@cloudscape-design/components/button'
@@ -8,10 +9,11 @@ import ContentLayout from '@cloudscape-design/components/content-layout'
 import Grid from '@cloudscape-design/components/grid'
 import Header from '@cloudscape-design/components/header'
 import Icon, { type IconProps } from '@cloudscape-design/components/icon'
+import Link from '@cloudscape-design/components/link'
 import Select, { type SelectProps } from '@cloudscape-design/components/select'
 import SpaceBetween from '@cloudscape-design/components/space-between'
 import Spinner from '@cloudscape-design/components/spinner'
-import { api, type Status } from '../api'
+import { api, REPRICE_ACTIVE, type Status } from '../api'
 import EChart from '../components/EChart'
 import UsageBreakdown from '../components/UsageBreakdown'
 import { latencyTrend, minAvgMaxBar, ttftTrend, usageTrend } from '../components/charts'
@@ -22,6 +24,7 @@ const TOTAL: SelectProps.Option = { value: 'TOTAL', label: 'All' }
 
 export default function Dashboard({ status }: { status?: Status }) {
   const { params, tz: tzName, noData, refresh } = useFilters()
+  const navigate = useNavigate()
   const [usageModel, setUsageModel] = useState<SelectProps.Option>(TOTAL)
   const [usageCaller, setUsageCaller] = useState<SelectProps.Option>(TOTAL)
   const [latencyModel, setLatencyModel] = useState<SelectProps.Option>(TOTAL)
@@ -94,7 +97,14 @@ export default function Dashboard({ status }: { status?: Status }) {
       <SpaceBetween size="l">
         {status && status.unpriced_models.length > 0 && (
           <Alert type="warning" header={`${status.unpriced_models.length} model(s) counted at $0`}>
-            No price is set for {status.unpriced_models.join(', ')}. Add one on the Pricing page, then run scripts/rebuild_costs.sh.
+            No price is set for {status.unpriced_models.join(', ')}. Add one on the{' '}
+            <Link href="/pricing" onFollow={(e) => { e.preventDefault(); navigate('/pricing') }}>Pricing page</Link>, then reprice usage.
+          </Alert>
+        )}
+        {status?.reprice && !status.reprice.dry_run && REPRICE_ACTIVE.includes(status.reprice.status) && (
+          <Alert type="info" header="Repricing past usage">
+            {status.reprice.months_total ? `${status.reprice.months_done ?? 0} of ${status.reprice.months_total} months done. ` : ''}
+            Figures change as each month finishes.
           </Alert>
         )}
         {noData && <Alert type="info">No usage recorded yet.</Alert>}

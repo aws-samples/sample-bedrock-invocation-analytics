@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { getCurrentUser, signOut } from 'aws-amplify/auth'
@@ -9,7 +9,7 @@ import KeyValuePairs from '@cloudscape-design/components/key-value-pairs'
 import BreadcrumbGroup from '@cloudscape-design/components/breadcrumb-group'
 import Spinner from '@cloudscape-design/components/spinner'
 import TopNavigation from '@cloudscape-design/components/top-navigation'
-import { api, type Status } from './api'
+import { api, REPRICE_ACTIVE, type Status } from './api'
 import { FiltersProvider } from './filters'
 import { useFilters } from './filters-context'
 import Login from './pages/Login'
@@ -36,7 +36,22 @@ export default function App() {
 function Shell({ onSignOut }: { onSignOut: () => void }) {
   const navigate = useNavigate()
   const { pathname } = useLocation()
-  const status = useQuery({ queryKey: ['status'], queryFn: api.status, refetchInterval: 60_000 })
+  const queryClient = useQueryClient()
+  const status = useQuery({
+    queryKey: ['status'],
+    queryFn: api.status,
+    refetchInterval: (q) => (q.state.data?.reprice && REPRICE_ACTIVE.includes(q.state.data.reprice.status) ? 10_000 : 60_000),
+  })
+  // A reprice that just finished (not a preview) changes the stored figures.
+  const reprice = status.data?.reprice
+  const wasActive = useRef(false)
+  useEffect(() => {
+    const active = !!reprice && REPRICE_ACTIVE.includes(reprice.status)
+    if (wasActive.current && !active && reprice?.status === 'done' && !reprice.dry_run) {
+      for (const key of ['dashboard', 'trend', 'reprice']) queryClient.invalidateQueries({ queryKey: [key] })
+    }
+    wasActive.current = active
+  }, [reprice, queryClient])
   const [toolsOpen, setToolsOpen] = useState(false)
   const [filtersOpen, setFiltersOpen] = useState(() => localStorage.getItem('filtersOpen') !== 'false')
   const { panel } = useFilters()
