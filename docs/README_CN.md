@@ -15,7 +15,7 @@ Amazon Bedrock 实时分析 — 监控多账户的 Token 用量、成本和性�
 - Header 显示 "Data up to"（基于 L2 checkpoint），反映真实数据新鲜度而非 UI 刷新时间
 - 自动刷新（1min / 5min）
 - 时间感知定价：价格变化后历史成本仍然正确；区分 5min 与 1h prompt cache 单价；rerank 与图像模型按次计价
-- 未定价模型在 Header 中提示并触发告警；补价后用 `scripts/rebuild_costs.sh` 重算历史成本
+- 未定价模型在 Header 中提示并触发告警；补价后管理员可在定价页面重算历史用量（预览、进度、取消）
 - CloudWatch 告警（SNS）：Lambda 错误、DLQ、Firehose 投递、L2 延迟、未定价调用
 - 定价设置页面：查看/编辑模型定价及历史，每周从 LiteLLM 自动同步
 - Athena 即席查询 Iceberg 事件表，支持深度排查
@@ -111,6 +111,7 @@ Amazon Bedrock 实时分析 — 监控多账户的 Token 用量、成本和性�
    - **incremental**（每 `cost_agg_interval_min` 分钟）：重算自 checkpoint 以来有新事件的小时，以及当前和上一小时。失败时 checkpoint 不前进。
    - **settle**（每小时）：重算最近 2 个完整日、收到迟到事件的日期，以及与 Iceberg 条数不一致的日期（每天检查一次近 90 天）；写 DAILY，月份结束后写 MONTHLY。`META/SETTLED#<account>#<region>` 记录已结算到哪一天，Dashboard 在此之前读 DAILY，之后读 HOURLY。
    - **rebuild**（`scripts/rebuild_costs.sh`）：对任意区间做同样的重算，用于重新定价。
+   - **重算任务**（定价页面 → Reprice usage）：从某天起或全部历史做同样的重算，由 incremental 分块推进，WebUI 显示进度与变化。
    三者由租约锁互斥。解析和计算分离，修正定价只需基于 Iceberg 重算，无需重新解析原始 S3。
 5. **`sync_pricing`** 每周从 [LiteLLM](https://github.com/BerriAI/litellm) 拉最新模型定价。
 6. **WebUI**：一个 Lambda 同时提供 React SPA 和 JSON API，部署在内部 ALB 后面（可选通过 VPC origin 在前面加 CloudFront）。它从 DynamoDB 读取数据（亚秒级响应），作为 serving 缓存层，每次 API 调用都校验 Cognito access token。Header 显示基于 L2 checkpoint 的 *"Data up to X"*,让用户能区分真实数据新鲜度和 UI 刷新时间。
@@ -195,7 +196,9 @@ AWS_DEFAULT_REGION=us-west-2 python3 scripts/seed_pricing.py \
 
 ## 重算历史成本
 
-新增或修正价格后（定价页面或 LiteLLM 同步）,基于 Iceberg 事件表重算受影响的日期：
+新增或修正价格后，管理员打开 **Pricing → Reprice usage**：选择起始日期（从该日所在月的 1 日起按整月重算，最后重算今天）或全部历史，先 **Preview** 查看每天、每月调用次数与成本的变化，再 **Reprice**。任务在后台按几分钟一块执行，可在月与月之间取消。
+
+也可以在命令行同步执行同样的重算：
 
 ```bash
 scripts/rebuild_costs.sh 2026-07-01 2026-07-31   # UTC 日期，含首尾

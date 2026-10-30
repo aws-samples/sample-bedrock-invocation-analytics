@@ -15,7 +15,7 @@ Real-time analytics for Amazon Bedrock — monitor token usage, costs, and perfo
 - "Data up to" timestamp in header — reflects actual data freshness (L2 checkpoint), not UI refresh time
 - Auto refresh (1min / 5min)
 - Time-aware pricing: correct historical costs even if prices change; separate 5min vs 1h prompt cache rates; per-request pricing for rerank and image models
-- Unpriced models are flagged in the header and alarmed; `scripts/rebuild_costs.sh` reprices history after a price is added
+- Unpriced models are flagged in the header and alarmed; after adding a price, admins reprice past usage from the Pricing page (preview, progress, cancel)
 - CloudWatch alarms (SNS) on Lambda errors, DLQs, Firehose delivery, L2 lag and unpriced usage
 - Pricing settings page: view/edit model pricing with history, weekly auto-sync from LiteLLM
 - Ad-hoc Athena queries on the raw Iceberg event log for deep investigation
@@ -112,6 +112,7 @@ Two-stage pipeline: **L1** (parse) turns every Bedrock call into a structured ev
    - **incremental** (every `cost_agg_interval_min`): recomputes the hours that received new events since its checkpoint, plus the current and previous hour. A failed run keeps the checkpoint.
    - **settle** (hourly): recomputes the last 2 completed days, days that got late events, and days whose count no longer matches Iceberg (daily check over 90 days); writes DAILY rows, and MONTHLY rows once a month is complete. `META/SETTLED#<account>#<region>` records the last day settled; the dashboard reads DAILY up to it and HOURLY after it.
    - **rebuild** (`scripts/rebuild_costs.sh`): the same recompute over any range, for repricing.
+   - **reprice jobs** (Pricing page → Reprice usage): the same recompute from a date or over all history, advanced in chunks by the incremental runs; progress and changes are shown in the WebUI.
    A lease lock keeps the three from running at once. Separating compute from parse means a pricing fix only needs a rebuild over Iceberg, no re-parsing of raw S3.
 5. **`sync_pricing`** pulls the latest model prices from [LiteLLM](https://github.com/BerriAI/litellm) weekly.
 6. **WebUI**: a React SPA and a JSON API served by one Lambda behind an internal ALB (optionally fronted by CloudFront through a VPC origin). It reads DynamoDB (sub-second) as a serving-layer cache and checks Cognito access tokens on every API call. The header shows *"Data up to X"* based on L2's checkpoint, so users can tell real-time data freshness apart from UI refresh time.
@@ -196,7 +197,9 @@ AWS_DEFAULT_REGION=us-west-2 python3 scripts/seed_pricing.py \
 
 ## Reprice Past Usage
 
-After adding or correcting a price (Pricing page or LiteLLM sync), recompute the affected days from the Iceberg event log:
+After adding or correcting a price, open **Pricing → Reprice usage** (admins). Pick a start date (whole UTC months from it are recomputed, then today) or all history, run **Preview** to see per-day and per-month changes in invocations and cost, then **Reprice**. The job runs in the background in chunks of a few minutes; it can be cancelled between months.
+
+From a shell, the same recompute runs synchronously:
 
 ```bash
 scripts/rebuild_costs.sh 2026-07-01 2026-07-31   # UTC dates, inclusive
