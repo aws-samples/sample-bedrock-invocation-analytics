@@ -22,9 +22,15 @@ import { formatCost, formatInTz, formatMs, formatNumber, shortModel } from '../f
 
 const TOTAL: SelectProps.Option = { value: 'TOTAL', label: 'All' }
 
+// Dismissing the unpriced banner hides it until the page is reloaded, or until the set of unpriced models changes.
+// Module scope, so it survives navigating to the Pricing page and back.
+let dismissedUnpriced = ''
+
 export default function Dashboard({ status }: { status?: Status }) {
   const { params, tz: tzName, noData, refresh } = useFilters()
   const navigate = useNavigate()
+  const unpricedKey = (status?.unpriced_models ?? []).map((m) => m.model).join('\n')
+  const [, setDismissed] = useState(dismissedUnpriced)  // re-render after dismissing
   const [usageModel, setUsageModel] = useState<SelectProps.Option>(TOTAL)
   const [usageCaller, setUsageCaller] = useState<SelectProps.Option>(TOTAL)
   const [latencyModel, setLatencyModel] = useState<SelectProps.Option>(TOTAL)
@@ -98,8 +104,9 @@ export default function Dashboard({ status }: { status?: Status }) {
       }
     >
       <SpaceBetween size="l">
-        {status && status.unpriced_models.length > 0 && (
-          <Alert type="warning" header={`${status.unpriced_models.length} model(s) counted at $0`}>
+        {status && status.unpriced_models.length > 0 && unpricedKey !== dismissedUnpriced && (
+          <Alert type="warning" header={`${status.unpriced_models.length} model(s) counted at $0`} dismissible
+            onDismiss={() => { dismissedUnpriced = unpricedKey; setDismissed(unpricedKey) }}>
             <SpaceBetween size="xxs">
               <span>No price applies to these models. {status.user.is_admin ? 'Set one on the Pricing page, then reprice usage.'
                 : `Ask a member of ${status.admin_group} to set one.`}</span>
