@@ -40,17 +40,31 @@ def versions_from_items(items: list[dict]) -> list[PriceVersion]:
     return out
 
 
+def model_items(pricing_table, model: str) -> list[dict]:
+    kwargs = {"KeyConditionExpression": Key("PK").eq(f"MODEL#{model}"), "ConsistentRead": True}  # a price saved just before a reprice applies
+    items = []
+    while True:
+        resp = pricing_table.query(**kwargs)
+        items.extend(resp.get("Items", []))
+        if "LastEvaluatedKey" not in resp:
+            return items
+        kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+
+def alias_target(items: list[dict]) -> str | None:
+    """An alias record (`price_as`) prices the model exactly like another model, e.g. an application inference profile."""
+    return next((i["price_as"] for i in items if i.get("price_as")), None)
+
+
 def load_versions(pricing_table, models: set[str]) -> dict[str, list[PriceVersion]]:
     out = {}
     for model in sorted(models):
-        kwargs = {"KeyConditionExpression": Key("PK").eq(f"MODEL#{model}"), "ConsistentRead": True}  # a price saved just before a reprice applies
-        items = []
-        while True:
-            resp = pricing_table.query(**kwargs)
-            items.extend(resp.get("Items", []))
-            if "LastEvaluatedKey" not in resp:
-                break
-            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        items = model_items(pricing_table, model)
+        target = alias_target(items)
+        if target:  # one level only: the target's own price rows, with their effective dates
+            items = model_items(pricing_table, target)
+            if alias_target(items):
+                items = []
         if items:
             out[model] = versions_from_items(items)
     return out

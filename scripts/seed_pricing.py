@@ -24,8 +24,12 @@ def main():
 
     session = boto3.Session(profile_name=profile) if profile else boto3.Session()
     table = session.resource("dynamodb").Table(table_name)
+    aliased = {i["PK"].removeprefix("MODEL#") for page in [table.scan(ProjectionExpression="PK, price_as")]
+               for i in page.get("Items", []) if i.get("price_as")}  # admin-set "priced as" models are kept
     with table.batch_writer() as batch:
         for model_id, fields in prices.items():
+            if model_id in aliased:
+                continue
             batch.put_item(Item={"PK": f"MODEL#{model_id}", "SK": INITIAL_EFFECTIVE_DATE, **fields, "source": "litellm"})
     print(f"Seeded {len(prices)} models to {table_name}")
 

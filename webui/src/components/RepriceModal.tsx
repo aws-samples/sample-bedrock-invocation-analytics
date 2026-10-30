@@ -36,8 +36,8 @@ export default function RepriceModal({ initialStart, onDismiss }: { initialStart
   })
   const accounts = useQuery({ queryKey: ['accounts'], queryFn: api.accounts })
   const [today] = useState(() => utcDay(new Date()))
-  const [scope, setScope] = useState<'from' | 'all'>('from')
-  const [start, setStart] = useState(() => initialStart ?? utcDay(new Date(Date.now() - 30 * 86_400_000)))
+  const [scope, setScope] = useState<'from' | 'all'>(initialStart === 'all' ? 'all' : 'from')
+  const [start, setStart] = useState(() => (initialStart && initialStart !== 'all' ? initialStart : utcDay(new Date(Date.now() - 30 * 86_400_000))))
 
   const current = job.data
   const active = job.isLoading || (!!current && REPRICE_ACTIVE.includes(current.status))

@@ -51,3 +51,17 @@ def test_put_batch_raises_when_records_keep_failing(monkeypatch):
     monkeypatch.setattr(parse_log, "firehose", FakeFirehose([1] * 10))
     with pytest.raises(RuntimeError):
         parse_log.put_batch([{"Data": b"a"}], attempts=3, sleep=lambda s: None)
+
+
+@pytest.mark.parametrize("arn, key", [
+    ("anthropic.claude-sonnet-4-20250514-v1:0", "anthropic.claude-sonnet-4-20250514-v1:0"),
+    ("arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-3-haiku-20240307-v1:0", "anthropic.claude-3-haiku-20240307-v1:0"),
+    ("arn:aws:bedrock:us-west-2:111122223333:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0",
+     "us.anthropic.claude-sonnet-4-20250514-v1:0"),
+    ("arn:aws:bedrock:us-west-2:111122223333:application-inference-profile/8b75bgbqm6ri", "application-inference-profile/8b75bgbqm6ri"),
+    ("arn:aws:bedrock:us-west-2:111122223333:imported-model/twdi0pznwga0", "imported-model/twdi0pznwga0"),
+    ("arn:aws:bedrock:us-west-2:111122223333:provisioned-model/abc123", "provisioned-model/abc123"),
+    ("arn:aws:bedrock:us-west-2:111122223333:custom-model/amazon.titan-text-lite-v1:0:4k/x1y2", "custom-model/amazon.titan-text-lite-v1:0:4k/x1y2"),
+])
+def test_model_key_keeps_resource_type_for_non_model_arns(arn, key):
+    assert parse_log.model_key(arn) == key

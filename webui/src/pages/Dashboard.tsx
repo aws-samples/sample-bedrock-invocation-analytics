@@ -13,7 +13,7 @@ import Link from '@cloudscape-design/components/link'
 import Select, { type SelectProps } from '@cloudscape-design/components/select'
 import SpaceBetween from '@cloudscape-design/components/space-between'
 import Spinner from '@cloudscape-design/components/spinner'
-import { api, REPRICE_ACTIVE, type Status } from '../api'
+import { api, MODEL_KINDS, REPRICE_ACTIVE, type Status, type UnpricedModel } from '../api'
 import EChart from '../components/EChart'
 import UsageBreakdown from '../components/UsageBreakdown'
 import { latencyTrend, minAvgMaxBar, ttftTrend, usageTrend } from '../components/charts'
@@ -97,8 +97,26 @@ export default function Dashboard({ status }: { status?: Status }) {
       <SpaceBetween size="l">
         {status && status.unpriced_models.length > 0 && (
           <Alert type="warning" header={`${status.unpriced_models.length} model(s) counted at $0`}>
-            No price is set for {status.unpriced_models.join(', ')}. Add one on the{' '}
-            <Link href="/pricing" onFollow={(e) => { e.preventDefault(); navigate('/pricing') }}>Pricing page</Link>, then reprice usage.
+            <SpaceBetween size="xxs">
+              <span>No price applies to these models. {status.user.is_admin ? 'Set one on the Pricing page, then reprice usage.'
+                : `Ask a member of ${status.admin_group} to set one.`}</span>
+              <ul className="unpriced-list">
+                {status.unpriced_models.map((m) => (
+                  <li key={m.model}>
+                    <UnpricedLine m={m} tz={tzName} />{' '}
+                    {status.user.is_admin && <Link href={`/pricing?model=${encodeURIComponent(m.model)}`}
+                      onFollow={(e) => { e.preventDefault(); navigate(`/pricing?model=${encodeURIComponent(m.model)}`) }}>Set price</Link>}
+                  </li>
+                ))}
+              </ul>
+              {status.unpriced_models.some((m) => m.kind === 'application-inference-profile') && (
+                <Box variant="small">
+                  An application inference profile is billed as the model it was created from. Find it with{' '}
+                  <code>aws bedrock get-inference-profile --inference-profile-identifier &lt;id&gt;</code>; for a deleted profile, look up its
+                  CreateInferenceProfile event in CloudTrail.
+                </Box>
+              )}
+            </SpaceBetween>
           </Alert>
         )}
         {status?.reprice && !status.reprice.dry_run && REPRICE_ACTIVE.includes(status.reprice.status) && (
@@ -173,5 +191,17 @@ export default function Dashboard({ status }: { status?: Status }) {
         )}
       </SpaceBetween>
     </ContentLayout>
+  )
+}
+
+function UnpricedLine({ m, tz }: { m: UnpricedModel; tz: string }) {
+  const where = m.accounts.map((a) => `${a.name} ${a.region}`).join(', ')
+  const day = (iso?: string) => (iso ? formatInTz(iso, tz, true).slice(0, 10) : '')
+  const span = m.first_seen && day(m.first_seen) !== day(m.last_seen) ? `${day(m.first_seen)} – ${day(m.last_seen)}` : day(m.first_seen)
+  return (
+    <span>
+      {m.kind ? `${MODEL_KINDS[m.kind] ?? m.kind} ` : ''}<b>{m.id}</b>
+      {[where, span].filter(Boolean).map((t) => ` · ${t}`)}
+    </span>
   )
 }

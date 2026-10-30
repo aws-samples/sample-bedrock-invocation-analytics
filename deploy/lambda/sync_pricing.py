@@ -90,6 +90,9 @@ def handler(event, context):
         ).get("Items", [])
         if items:
             current = items[0]
+            if current.get("price_as"):  # priced as another model by an admin; never overwrite
+                skipped += 1
+                continue
             if same_prices(current, new):
                 skipped += 1
                 continue

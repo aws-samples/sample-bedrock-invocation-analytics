@@ -146,6 +146,26 @@ def put_batch(records, attempts=PUT_ATTEMPTS, sleep=time.sleep):
     raise RuntimeError(f"Firehose still rejecting {len(pending)}/{len(records)} records after {attempts} attempts")
 
 
+# ARN resource types whose ID is the model (or system profile) ID used for pricing.
+MODEL_ARN_TYPES = ("foundation-model", "inference-profile")
+
+
+def model_key(model_id: str) -> str:
+    """Pricing/display key for a log modelId.
+
+    Foundation-model and system inference-profile ARNs reduce to their ID (`anthropic.claude-…`, `us.anthropic.…`).
+    Other ARNs keep their resource type (`application-inference-profile/<id>`, `imported-model/<id>`,
+    `custom-model/<base>/<id>`) so they stay recognizable and can be priced by alias.
+    """
+    if not model_id.startswith("arn:"):
+        return model_id
+    resource = model_id.split(":", 5)[-1]
+    kind, _, rest = resource.partition("/")
+    if not rest:
+        return resource
+    return rest if kind in MODEL_ARN_TYPES else f"{kind}/{rest}"
+
+
 def build_event(record, path_account_id, path_region, source_s3_key):
     """Transform a raw Bedrock log record into the Iceberg usage_events schema.
 
@@ -156,9 +176,7 @@ def build_event(record, path_account_id, path_region, source_s3_key):
         print(f"Cannot parse timestamp: {timestamp_str}")
         return None
 
-    model_id = record.get("modelId") or "unknown"
-    if model_id.startswith("arn:"):
-        model_id = model_id.rsplit("/", 1)[-1]
+    model_id = model_key(record.get("modelId") or "unknown")
 
     account_id = record.get("accountId") or path_account_id
     region = record.get("region") or path_region

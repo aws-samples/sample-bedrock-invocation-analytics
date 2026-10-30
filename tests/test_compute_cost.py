@@ -399,3 +399,51 @@ def test_read_path_ranges_ending_before_daily_end_off_midnight(monkeypatch):
     assert plan(datetime(2026, 8, 31, 16, tzinfo=UTC), datetime(2026, 9, 30, 16, tzinfo=UTC)) == [  # UTC+8 September
         ("HOURLY", "2026-08-31T16", "2026-08-31T23"), ("DAILY", "2026-09-01", "2026-09-29"),
         ("HOURLY", "2026-09-30T00", "2026-09-30T15")]
+
+
+# ── model identity (N3) ──
+
+@pytest.fixture
+def pricing_table():
+    with mock_aws():
+        boto3.client("dynamodb", region_name="us-west-2").create_table(
+            TableName="pricing-test", BillingMode="PAY_PER_REQUEST",
+            KeySchema=[{"AttributeName": "PK", "KeyType": "HASH"}, {"AttributeName": "SK", "KeyType": "RANGE"}],
+            AttributeDefinitions=[{"AttributeName": "PK", "AttributeType": "S"}, {"AttributeName": "SK", "AttributeType": "S"}])
+        yield boto3.resource("dynamodb", region_name="us-west-2").Table("pricing-test")
+
+
+def test_alias_resolves_to_target_versions_one_level_only(pricing_table):
+    t = pricing_table
+    t.put_item(Item={"PK": "MODEL#global.m", "SK": "2000-01-01T00:00:00Z", "input_per_1k": "0.001"})
+    t.put_item(Item={"PK": "MODEL#global.m", "SK": "2026-09-01T00:00:00Z", "input_per_1k": "0.002"})
+    t.put_item(Item={"PK": "MODEL#application-inference-profile/abc", "SK": "2000-01-01T00:00:00Z", "price_as": "global.m"})
+    t.put_item(Item={"PK": "MODEL#application-inference-profile/chain", "SK": "2000-01-01T00:00:00Z",
+                     "price_as": "application-inference-profile/abc"})
+    vs = pricing.load_versions(t, {"application-inference-profile/abc", "application-inference-profile/chain", "missing"})
+    alias = vs["application-inference-profile/abc"]
+    assert pricing.price_at(alias, datetime(2026, 8, 1, tzinfo=UTC))[0] == 1000
+    assert pricing.price_at(alias, datetime(2026, 10, 1, tzinfo=UTC))[0] == 2000  # follows the target's later price
+    assert "application-inference-profile/chain" not in vs and "missing" not in vs
+
+
+def test_imported_and_provisioned_models_are_not_unpriced(monkeypatch):
+    rows = [{"kind": "MODEL", "pk": "A#us-west-2", "hour": "2026-07-21T11", "model_id": m, "caller": None,
+             "unpriced": "3", "unpriced_first": "2026-07-21 11:00:00.000 UTC", "unpriced_last": "2026-07-21 11:30:00.000 UTC",
+             **{f: "1" for f in cc.VALUE_FIELDS}}
+            for m in ("imported-model/x", "provisioned-model/y", "application-inference-profile/z")]
+    monkeypatch.setattr(cc, "athena_rows", lambda sql, with_scanned=False: (rows, 0) if with_scanned else [])
+    monkeypatch.setattr(pricing, "load_versions", lambda table, models: {})
+    monkeypatch.setattr(cc, "PRICING_TABLE", "p")
+    with mock_aws():
+        out, unpriced, _ = cc.aggregate(datetime(2026, 7, 21, tzinfo=UTC), datetime(2026, 7, 22, tzinfo=UTC))
+    assert set(unpriced) == {"application-inference-profile/z"} and unpriced["application-inference-profile/z"]["accounts"] == {"A#us-west-2"}
+    assert "HOURLY#2026-07-21T11#MODEL#imported-model/x" in out["A#us-west-2"]  # still counted
+
+
+def test_unpriced_marker_merges_accounts(ddb):
+    now = datetime(2026, 10, 30, tzinfo=UTC)
+    span = lambda acct: {"count": 1, "first": now, "last": now, "accounts": {acct}}  # noqa: E731
+    cc.mark_unpriced({"application-inference-profile/z": span("A#us-west-2")}, now)
+    cc.mark_unpriced({"application-inference-profile/z": span("B#us-east-1")}, now)
+    assert cc.get_meta("UNPRICED#application-inference-profile/z")["accounts"] == {"A#us-west-2", "B#us-east-1"}

@@ -214,9 +214,23 @@ def pricing_history(model: str):
 def pricing_save(model: str):
     user = current_user(admin=True)
     body = json_object()
-    effective_date = parse_time("effective_date", str(body.get("effective_date", "")))
-    effective = effective_date.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
-    store.save_pricing(parse_model(model), parse_prices(body), effective, updated_by=user_email(user.username))
+    model_id = parse_model(model)
+    try:
+        if "price_as" in body:
+            if set(body) - {"price_as", "label"}:
+                raise BadRequest("price_as accepts only label alongside it")
+            target, label = body.get("price_as"), body.get("label", "")
+            if not isinstance(target, str) or not MODEL_RE.match(target):
+                raise BadRequest("price_as must be a model id")
+            if not isinstance(label, str) or len(label) > 128 or any(ord(c) < 32 for c in label):
+                raise BadRequest("label must be at most 128 printable characters")
+            store.save_price_alias(model_id, target, label, updated_by=user_email(user.username))
+            return Response(status_code=204, body="")
+        effective_date = parse_time("effective_date", str(body.get("effective_date", "")))
+        effective = effective_date.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+        store.save_pricing(model_id, parse_prices(body), effective, updated_by=user_email(user.username))
+    except store.PricingConflict as e:
+        return json_error(409, str(e))
     return Response(status_code=204, body="")
 
 

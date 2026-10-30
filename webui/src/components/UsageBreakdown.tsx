@@ -6,7 +6,7 @@ import Container from '@cloudscape-design/components/container'
 import Header from '@cloudscape-design/components/header'
 import Table, { type TableProps } from '@cloudscape-design/components/table'
 import Tabs from '@cloudscape-design/components/tabs'
-import type { UsageRow } from '../api'
+import { isNotTokenBilled, type UsageRow } from '../api'
 import { formatCost, formatNumber, round4 } from '../format'
 import EChart from './EChart'
 import { pie, usageCostBar } from './charts'
@@ -37,7 +37,9 @@ export default function UsageBreakdown<T extends UsageRow>({ title, rows, nameKe
     ]
   }, [rows, nameKey])
 
-  const money = (key: keyof UsageRow) => (r: T) => formatCost(r[key])
+  // Imported and provisioned models are billed per model unit and time; a $0 here would read as free.
+  const money = (key: keyof UsageRow) => (r: T) => (isNotTokenBilled(label(r))
+    ? <Box variant="small" color="text-status-inactive">not estimated</Box> : formatCost(r[key]))
   const columns: TableProps.ColumnDefinition<T>[] = [
     { id: 'name', header: nameHeader, cell: label, sortingComparator: (a, b) => label(a).localeCompare(label(b)), isRowHeader: true },
     { id: 'invocations', header: 'Calls', cell: (r) => r.invocations.toLocaleString(), sortingField: 'invocations' },

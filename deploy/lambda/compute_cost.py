@@ -57,6 +57,8 @@ SUM_FIELDS = ("invocations", "input_tokens", "output_tokens", "cache_read_tokens
 MAX_FIELDS = ("max_latency_ms", "tpot_max")
 MIN_FIELDS = ("min_latency_ms", "tpot_min")
 VALUE_FIELDS = SUM_FIELDS + MAX_FIELDS + MIN_FIELDS
+# Billed per model unit and time, not per token (parse_log keeps these ARN resource types): counted, never "unpriced".
+NOT_TOKEN_BILLED = ("imported-model/", "provisioned-model/")
 
 _clients: dict = {}
 
@@ -378,8 +380,9 @@ def aggregate(ts_from: datetime, ts_to: datetime):
         dim = {"MODEL": f"MODEL#{r['model_id']}", "CALLER": f"CALLER#{r['caller']}", "TOTAL": "TOTAL"}[kind]
         values = {f: int(r[f] or 0) for f in VALUE_FIELDS}
         out[r["pk"]][f"HOURLY#{r['hour']}#{dim}"] = {k: v for k, v in values.items() if v or k in SUM_FIELDS}
-        if kind == "MODEL" and int(r["unpriced"] or 0):
-            span = unpriced.setdefault(r["model_id"], {"count": 0, "first": None, "last": None})
+        if kind == "MODEL" and int(r["unpriced"] or 0) and not r["model_id"].startswith(NOT_TOKEN_BILLED):
+            span = unpriced.setdefault(r["model_id"], {"count": 0, "first": None, "last": None, "accounts": set()})
+            span["accounts"].add(r["pk"])
             first, last = athena_ts(r["unpriced_first"]), athena_ts(r["unpriced_last"])
             span["count"] += int(r["unpriced"])
             span["first"] = min(filter(None, (span["first"], first)))
@@ -613,8 +616,10 @@ def mark_unpriced(unpriced: dict[str, dict], now: datetime):
         current = get_meta(f"UNPRICED#{model}") or {}
         first = min(filter(None, (parse_iso(current.get("first_seen")), span["first"])))
         last = max(filter(None, (parse_iso(current.get("last_seen")), span["last"])))
+        accounts = set(current.get("accounts") or ()) | set(span.get("accounts") or ())  # pk = account#region
         table.put_item(Item={"PK": "META", "SK": f"UNPRICED#{model}", "first_seen": first.isoformat(),
-                             "last_seen": last.isoformat(), "updated_at": now.isoformat()})
+                             "last_seen": last.isoformat(), "updated_at": now.isoformat(),
+                             **({"accounts": accounts} if accounts else {})})
 
 
 def clear_legacy_unpriced():

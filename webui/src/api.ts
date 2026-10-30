@@ -98,12 +98,21 @@ export interface RepriceJob {
   error?: string
 }
 
+export interface UnpricedModel {
+  model: string
+  kind: string
+  id: string
+  accounts: { key: string; name: string; region: string }[]
+  first_seen?: string
+  last_seen?: string
+}
+
 export const REPRICE_ACTIVE: RepriceStatus[] = ['queued', 'running', 'cancelling']
 
 export interface Status {
   data_up_to: string | null
   reprice: Pick<RepriceJob, 'job_id' | 'status' | 'dry_run' | 'months_done' | 'months_total' | 'today_done'> | null
-  unpriced_models: string[]
+  unpriced_models: UnpricedModel[]
   pricing_sync: { synced_at?: string; models_updated?: number; models_added?: number; models_skipped?: number } | null
   user: { username: string; email: string; is_admin: boolean }
   admin_group: string
@@ -118,6 +127,20 @@ export type PricingRecord = Record<PriceField, number> & {
   effective_date: string
   source: string
   updated_by: string
+  price_as?: string
+  label?: string
+  alias_broken?: boolean
+}
+
+/** ARN resource types billed per model unit and time, not per token: usage is counted, cost isn't estimated. */
+export const NOT_TOKEN_BILLED = ['imported-model/', 'provisioned-model/']
+export const isNotTokenBilled = (model: string) => NOT_TOKEN_BILLED.some((p) => model.startsWith(p))
+
+export const MODEL_KINDS: Record<string, string> = {
+  'application-inference-profile': 'Application inference profile',
+  'imported-model': 'Imported model',
+  'provisioned-model': 'Provisioned model',
+  'custom-model': 'Custom model',
 }
 
 export class ApiError extends Error {
@@ -176,6 +199,8 @@ export const api = {
     request<{ job: RepriceJob }>('/api/reprice', { method: 'POST', body: JSON.stringify({ start, dry_run: dryRun }) }).then((r) => r.job),
   cancelReprice: (jobId: string) =>
     request<{ job: RepriceJob }>(`/api/reprice?${qs({ job_id: jobId })}`, { method: 'DELETE' }).then((r) => r.job),
+  savePriceAlias: (model: string, priceAs: string, label: string) =>
+    request<void>(`/api/pricing/${encodeURIComponent(model)}`, { method: 'PUT', body: JSON.stringify({ price_as: priceAs, label }) }),
   deletePricing: (model: string, effectiveDate: string) =>
     request<void>(`/api/pricing/${encodeURIComponent(model)}?${qs({ effective_date: effectiveDate })}`, { method: 'DELETE' }),
 }

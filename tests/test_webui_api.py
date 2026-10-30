@@ -285,3 +285,49 @@ def test_reprice_start_returns_202_when_kick_fails(reprice_api):
     finally:
         store.REPRICE_TICK_FUNCTION = ""
     assert call("/api/reprice", "POST", groups=[ADMIN], body={"start": "all"})[0] == 202
+
+
+def test_price_alias_validation_and_listing(api):
+    from moto import mock_aws
+    import boto3
+    with mock_aws():
+        boto3.client("dynamodb", region_name="us-west-2").create_table(
+            TableName="pricing-test", BillingMode="PAY_PER_REQUEST",
+            KeySchema=[{"AttributeName": "PK", "KeyType": "HASH"}, {"AttributeName": "SK", "KeyType": "RANGE"}],
+            AttributeDefinitions=[{"AttributeName": "PK", "AttributeType": "S"}, {"AttributeName": "SK", "AttributeType": "S"}])
+        api.setattr(store, "PRICING_TABLE", "pricing-test")
+        api.setattr(store, "_clients", {})
+        store._pricing().put_item(Item={"PK": "MODEL#global.m", "SK": "2026-01-01T00:00:00Z", "input_per_1k": "0.003"})
+        path = "/api/pricing/application-inference-profile%2Fabc"
+        assert call(path, "PUT", body={"price_as": "global.m"})[0] == 403
+        assert call(path, "PUT", groups=[ADMIN], body={"price_as": "nope"})[0] == 409  # target has no price
+        assert call(path, "PUT", groups=[ADMIN], body={"price_as": "global.m", "input_per_1k": 1})[0] == 400
+        assert call(path, "PUT", groups=[ADMIN], body={"price_as": "global.m", "label": "team-a"})[0] == 204
+        listed = {r["model_id"]: r for r in json.loads(call("/api/pricing")[2])["models"]}
+        alias = listed["application-inference-profile/abc"]
+        assert alias["price_as"] == "global.m" and alias["label"] == "team-a" and alias["input_per_1k"] == 0.003
+        direct = {"effective_date": "2026-11-01T00:00:00Z", "input_per_1k": 1}
+        assert call(path, "PUT", groups=[ADMIN], body=direct)[0] == 409  # alias and own prices can't coexist
+        assert call("/api/pricing/x", "PUT", groups=[ADMIN], body={"price_as": "application-inference-profile/abc"})[0] == 409
+        for imported in ("/api/pricing/imported-model%2Fq", ):
+            assert call(imported, "PUT", groups=[ADMIN], body=direct)[0] == 409
+            assert call(imported, "PUT", groups=[ADMIN], body={"price_as": "global.m"})[0] == 409
+        store._pricing().delete_item(Key={"PK": "MODEL#global.m", "SK": "2026-01-01T00:00:00Z"})
+        listed = {r["model_id"]: r for r in json.loads(call("/api/pricing")[2])["models"]}
+        assert listed["application-inference-profile/abc"]["alias_broken"] is True
+
+
+def test_status_lists_unpriced_with_type_and_account(api):
+    api.setattr(store, "get_l2_checkpoint", lambda: {})
+    api.setattr(store, "get_pricing_sync_info", lambda: None)
+    api.setattr(store, "get_reprice_job", lambda: None)
+    api.setattr(store, "_account_names", lambda: {"111122223333": "Lab"})
+
+    class T:
+        def query(self, **kw):
+            return {"Items": [{"SK": "UNPRICED#application-inference-profile/8b75bgbqm6ri", "accounts": {"111122223333#us-west-2"},
+                               "first_seen": "2026-10-08T07:20:14+00:00", "last_seen": "2026-10-08T07:20:14+00:00"}]}
+    api.setattr(store, "_usage", lambda: T())
+    m = json.loads(call("/api/status")[2])["unpriced_models"][0]
+    assert m["kind"] == "application-inference-profile" and m["id"] == "8b75bgbqm6ri"
+    assert m["accounts"] == [{"key": "111122223333#us-west-2", "name": "Lab", "region": "us-west-2"}]

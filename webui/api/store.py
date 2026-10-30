@@ -115,14 +115,24 @@ def get_l2_checkpoint() -> dict | None:
     return resp.get("Item")
 
 
-def unpriced_models() -> list[str]:
+def unpriced_models() -> list[dict]:
     """Models with events counted at $0 (META/UNPRICED#<model>; cleared once a recompute covers them priced)."""
     try:
         items = _usage().query(KeyConditionExpression=Key("PK").eq("META") & Key("SK").begins_with("UNPRICED#"))["Items"]
     except Exception as e:  # noqa: BLE001 — a warning banner must not break the dashboard
         print(f"[WARN] Failed to read unpriced markers: {e}")
         return []
-    return sorted(i["SK"].removeprefix("UNPRICED#") for i in items)
+    names = _account_names()
+    out = []
+    for i in items:
+        model = i["SK"].removeprefix("UNPRICED#")
+        kind, _, rid = model.rpartition("/") if "/" in model else ("", "", model)
+        accounts = sorted(i.get("accounts") or ())
+        out.append({"model": model, "kind": kind.split("/")[0], "id": rid,
+                    "accounts": [{"key": a, "name": names.get(a.split("#")[0], a.split("#")[0]), "region": a.split("#")[-1]}
+                                 for a in accounts],
+                    "first_seen": i.get("first_seen"), "last_seen": i.get("last_seen")})
+    return sorted(out, key=lambda m: m["model"])
 
 
 def _account_names() -> dict[str, str]:
@@ -364,8 +374,11 @@ PRICE_FIELDS = ("input_per_1k", "output_per_1k", "cache_read_per_1k", "cache_wri
 
 
 def _pricing_record(model_id: str, item: dict) -> dict:
-    return {"model_id": model_id, "effective_date": item["SK"], "source": item.get("source", ""),
-            "updated_by": item.get("updated_by", ""), **{f: float(item.get(f, 0) or 0) for f in PRICE_FIELDS}}
+    record = {"model_id": model_id, "effective_date": item["SK"], "source": item.get("source", ""),
+              "updated_by": item.get("updated_by", ""), **{f: float(item.get(f, 0) or 0) for f in PRICE_FIELDS}}
+    if item.get("price_as"):
+        record.update(price_as=item["price_as"], label=item.get("label", ""))
+    return record
 
 
 def get_all_pricing() -> list[dict]:
@@ -380,7 +393,17 @@ def get_all_pricing() -> list[dict]:
         pk = item["PK"]
         if pk.startswith("MODEL#") and (pk not in latest or item["SK"] > latest[pk]["SK"]):
             latest[pk] = item
-    return [_pricing_record(pk.removeprefix("MODEL#"), item) for pk, item in sorted(latest.items())]
+    records = [_pricing_record(pk.removeprefix("MODEL#"), item) for pk, item in sorted(latest.items())]
+    current = {r["model_id"]: r for r in records}
+    for r in records:  # show an alias with the prices it currently resolves to
+        if not r.get("price_as"):
+            continue
+        target = current.get(r["price_as"])
+        if target and not target.get("price_as"):
+            r.update({f: target[f] for f in PRICE_FIELDS})
+        else:
+            r["alias_broken"] = True  # target lost its price: usage of this model counts as unpriced
+    return records
 
 
 def get_pricing_sync_info() -> dict | None:
@@ -418,6 +441,7 @@ def get_ttft_trend(model_id: str, start_dt: datetime, end_dt: datetime) -> list[
 
 def save_pricing(model_id: str, prices: dict[str, float], effective_date: str, updated_by: str):
     """Save a manual pricing record with every price field, so cache and per-request prices aren't dropped."""
+    check_direct_price(model_id)
     _pricing().put_item(Item={
         "PK": f"MODEL#{model_id}",
         "SK": effective_date,
@@ -425,6 +449,47 @@ def save_pricing(model_id: str, prices: dict[str, float], effective_date: str, u
         "source": "manual",
         "updated_by": updated_by,
     })
+
+
+ALIAS_EFFECTIVE = "2000-01-01T00:00:00Z"  # an alias applies to all usage; the target's own dates decide prices
+
+
+class PricingConflict(Exception):
+    pass
+
+
+def _model_items(model_id: str) -> list[dict]:
+    return _pricing().query(KeyConditionExpression=Key("PK").eq(f"MODEL#{model_id}"), ConsistentRead=True).get("Items", [])
+
+
+def save_price_alias(model_id: str, target: str, label: str, updated_by: str):
+    """Price `model_id` exactly like `target` (an existing, directly priced model). Replaces any existing alias."""
+    if target == model_id:
+        raise PricingConflict("A model can't be priced as itself")
+    if model_id.startswith(NOT_TOKEN_BILLED):
+        raise PricingConflict("Imported and provisioned models are billed per model unit and time, not per token")
+    own = _model_items(model_id)
+    if any(not i.get("price_as") for i in own):
+        raise PricingConflict(f"{model_id} has its own prices; delete them before pricing it as another model")
+    target_items = _model_items(target)
+    if not target_items:
+        raise PricingConflict(f"{target} has no price")
+    if any(i.get("price_as") for i in target_items):
+        raise PricingConflict(f"{target} is itself priced as another model")
+    # Same key as any existing alias: overwritten in place, so the model is never briefly unpriced.
+    _pricing().put_item(Item={"PK": f"MODEL#{model_id}", "SK": ALIAS_EFFECTIVE, "price_as": target, "label": label,
+                              "source": "alias", "updated_by": updated_by})
+
+
+NOT_TOKEN_BILLED = ("imported-model/", "provisioned-model/")  # same list as compute_cost.py
+
+
+def check_direct_price(model_id: str):
+    """Own prices and an alias can't coexist; models other models are priced as stay direct."""
+    if model_id.startswith(NOT_TOKEN_BILLED):
+        raise PricingConflict("Imported and provisioned models are billed per model unit and time, not per token")
+    if any(i.get("price_as") for i in _model_items(model_id)):
+        raise PricingConflict(f"{model_id} is priced as another model; delete that first")
 
 
 def get_pricing_history(model_id: str) -> list[dict]:
