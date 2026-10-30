@@ -197,6 +197,8 @@ AWS_DEFAULT_REGION=us-west-2 python3 scripts/seed_pricing.py \
 
 ## Reprice Past Usage
 
+Calls made through an application inference profile or an imported model appear as `application-inference-profile/<id>` and `imported-model/<id>`. A profile is billed as the model it was created from: on the Pricing page choose **Price as another model** and pick its source (`global.*`, `us.*`/`eu.*`/`apac.*`, or the single-Region model ID). Imported and provisioned models are billed per model unit and time, so their calls and tokens are counted but their cost isn't estimated.
+
 After adding or correcting a price, open **Pricing → Reprice usage** (admins). Pick a start date (whole UTC months from it are recomputed, then today) or all history, run **Preview** to see per-day and per-month changes in invocations and cost, then **Reprice**. The job runs in the background in chunks of a few minutes; it can be cancelled between months.
 
 From a shell, the same recompute runs synchronously:

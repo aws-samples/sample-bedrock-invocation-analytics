@@ -196,6 +196,8 @@ AWS_DEFAULT_REGION=us-west-2 python3 scripts/seed_pricing.py \
 
 ## 重算历史成本
 
+通过应用推理配置文件或导入模型发起的调用显示为 `application-inference-profile/<id>` 和 `imported-model/<id>`。应用推理配置文件按创建它的模型计费：在定价页面选择 **Price as another model**，选择其来源（`global.*`、`us.*`/`eu.*`/`apac.*`，或单区域模型 ID）。导入模型和预置吞吐量按模型单元和时长计费，只统计调用次数与 token，不估算成本。
+
 新增或修正价格后，管理员打开 **Pricing → Reprice usage**：选择起始日期（从该日所在月的 1 日起按整月重算，最后重算今天）或全部历史，先 **Preview** 查看每天、每月调用次数与成本的变化，再 **Reprice**。任务在后台按几分钟一块执行，可在月与月之间取消。
 
 也可以在命令行同步执行同样的重算：
