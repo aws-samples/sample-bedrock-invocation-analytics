@@ -7,7 +7,7 @@ Real-time analytics for Amazon Bedrock — monitor token usage, costs, and perfo
 > ⚠️ This sample is for demonstration purposes only and is not intended for production use. Use at your own risk.
 
 ## Features
-- Summary cards: invocations, input/output tokens, cache tokens, estimated cost, avg latency, avg TPOT
+- Summary cards: invocations, input/output tokens, cache read and cache write tokens, estimated cost, avg latency, avg TPOT
 - Token usage & cost by model and by caller (chart / pie / table views) with per-token-type cost breakdown (input / output / cache read / cache write)
 - Performance: latency by model (min/avg/max) + latency trend with model selector
 - TPOT by model (min/avg/max) + TTFT trend from CloudWatch (avg/p99)

@@ -68,14 +68,17 @@ export default function Dashboard({ status }: { status?: Status }) {
   }, [data])
 
   const summary = data?.summary
-  const cards: [string, string, IconProps.Name, IconProps.Variant][] | undefined = summary && [
-    ['Total invocations', formatNumber(summary.invocations), 'call', 'link'],
-    ['Input tokens', formatNumber(summary.input_tokens), 'upload', 'success'],
-    ['Output tokens', formatNumber(summary.output_tokens), 'download', 'warning'],
-    ['Cache tokens', formatNumber(summary.cache_read_tokens + summary.cache_write_tokens), 'redo', 'link'],
-    ['Estimated cost', formatCost(summary.cost_usd), 'ticket', 'error'],
+  // Token counts first, then requests, cost and speed, so each group fills one row of four.
+  // Blue = sent to the model / written to the cache, green = returned by the model / read from the cache.
+  const cards: [string, string, IconProps.Name | keyof typeof CUSTOM_ICONS, IconProps.Variant][] | undefined = summary && [
+    ['Input tokens', formatNumber(summary.input_tokens), 'upload', 'link'],
+    ['Output tokens', formatNumber(summary.output_tokens), 'download', 'success'],
+    ['Cache write tokens', formatNumber(summary.cache_write_tokens), 'cache-write', 'link'],
+    ['Cache read tokens', formatNumber(summary.cache_read_tokens), 'cache-read', 'success'],
+    ['Total invocations', formatNumber(summary.invocations), 'send', 'link'],
+    ['Estimated cost', formatCost(summary.cost_usd), 'cost', 'warning'],
     ['Avg latency', formatMs(summary.avg_latency_ms), 'status-pending', 'subtle'],
-    ['Avg TPOT', `${summary.avg_tpot.toFixed(2)}ms`, 'status-in-progress', 'subtle'],
+    ['Avg TPOT', `${summary.avg_tpot.toFixed(2)}ms`, 'speed', 'subtle'],
   ]
   const rangeText = params && `${formatInTz(params.start, tzName, true)} → ${formatInTz(params.end, tzName, true)}`
 
@@ -136,7 +139,8 @@ export default function Dashboard({ status }: { status?: Status }) {
                 <Container key={title} fitHeight>
                   <div className="summary-card">
                     <div className="summary-card-label">
-                      <Icon name={icon} variant={variant} />
+                      {icon in CUSTOM_ICONS ? <Icon svg={CUSTOM_ICONS[icon as keyof typeof CUSTOM_ICONS]} variant={variant} />
+                        : <Icon name={icon as IconProps.Name} variant={variant} />}
                       <Box variant="awsui-key-label">{title}</Box>
                     </div>
                     <Box fontSize="heading-xl" fontWeight="bold" padding={{ top: 'xs' }}>
@@ -204,4 +208,33 @@ function UnpricedLine({ m, tz }: { m: UnpricedModel; tz: string }) {
       {[where, span].filter(Boolean).map((t) => ` · ${t}`)}
     </span>
   )
+}
+
+// Icons Cloudscape lacks, drawn in its 16px stroke style: cost, speed (TPOT), and cache hit / cache write on a database.
+const DB = 'M2 3.5c0 1.1 2.2 2 5 2s5-.9 5-2-2.2-2-5-2-5 .9-5 2Zm0 0v8c0 1.1 2.2 2 5 2M2 7.5c0 1.1 2.2 2 5 2M12 3.5V8'
+const CUSTOM_ICONS = {
+  cost: (
+    <svg viewBox="0 0 16 16" focusable="false" aria-hidden="true">
+      <circle cx="8" cy="8" r="7" />
+      <path d="M10.4 5.6C10 5 9.1 4.6 8 4.6c-1.4 0-2.4.7-2.4 1.7s1 1.4 2.4 1.7 2.4.7 2.4 1.7-1 1.7-2.4 1.7c-1.1 0-2-.4-2.4-1M8 3.2v1.4M8 11.4v1.4" />
+    </svg>
+  ),
+  speed: (
+    <svg viewBox="0 0 16 16" focusable="false" aria-hidden="true">
+      <path d="M2.3 12.5a6.5 6.5 0 1 1 11.4 0M8 10.5l3-3.5" />
+      <circle cx="8" cy="11" r="1" />
+    </svg>
+  ),
+  'cache-read': (
+    <svg viewBox="0 0 16 16" focusable="false" aria-hidden="true">
+      <path d={DB} />
+      <path d="M13 9.5l-2.5 3h3l-2.5 3" />
+    </svg>
+  ),
+  'cache-write': (
+    <svg viewBox="0 0 16 16" focusable="false" aria-hidden="true">
+      <path d={DB} />
+      <path d="M12.5 10v5M10 12.5h5" />
+    </svg>
+  ),
 }

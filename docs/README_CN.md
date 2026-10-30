@@ -7,7 +7,7 @@ Amazon Bedrock 实时分析 — 监控多账户的 Token 用量、成本和性�
 > ⚠️ 本示例仅用于演示用途，不适合用于生产环境。使用风险自负。
 
 ## 功能
-- 概览卡片：调用次数、输入/输出 Token、缓存 Token、预估成本、平均延迟、平均 TPOT
+- 概览卡片：调用次数、输入/输出 Token、缓存读取 Token、缓存写入 Token、预估成本、平均延迟、平均 TPOT
 - 按模型和调用者的 Token 用量与成本（图表 / 饼图 / 表格视图），成本按 Token 类型分拆（输入 / 输出 / 缓存读 / 缓存写)
 - 性能分析：按模型延迟（min/avg/max）+ 延迟趋势（支持按模型筛选）
 - TPOT 分析：按模型 TPOT（min/avg/max）+ CloudWatch TTFT 趋势（avg/p99）
