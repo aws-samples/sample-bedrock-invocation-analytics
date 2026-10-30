@@ -358,3 +358,44 @@ def test_partial_rewrite_never_clears_unpriced_marker(ddb, monkeypatch):
     assert cc.get_meta("UNPRICED#m")  # 09-10 was not rewritten, so it still shows $0
     cc.settle_days({"pk": {date(2026, 9, 1) + timedelta(days=n) for n in range(30)}}, now, Ctx(), dry_run=False, markers={})
     assert cc.get_meta("UNPRICED#m") is None
+
+
+def test_read_path_range_starting_mid_day_today(monkeypatch):
+    import store
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 30, 12, 40, tzinfo=UTC)
+    monkeypatch.setattr(store, "datetime", Frozen)
+    today = datetime(2026, 10, 30, tzinfo=UTC)
+    # "Today" for a user at UTC-7 starts at 07:00 UTC
+    assert store._plan_segments(today + timedelta(hours=7), Frozen.now(), daily_end=today) == [
+        ("HOURLY", "2026-10-30T07", "2026-10-30T12")]
+    assert store._plan_segments(today + timedelta(hours=3), today + timedelta(hours=4), daily_end=today) == [
+        ("HOURLY", "2026-10-30T03", "2026-10-30T03")]
+    # a mid-day start on an earlier day still hands over to DAILY at midnight
+    assert store._plan_segments(datetime(2026, 10, 20, 15, tzinfo=UTC), Frozen.now(), daily_end=today) == [
+        ("HOURLY", "2026-10-20T15", "2026-10-20T23"), ("DAILY", "2026-10-21", "2026-10-29"),
+        ("HOURLY", "2026-10-30T00", "2026-10-30T12")]
+
+
+def test_read_path_ranges_ending_before_daily_end_off_midnight(monkeypatch):
+    import store
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 30, 12, 40, tzinfo=UTC)
+    monkeypatch.setattr(store, "datetime", Frozen)
+    de = datetime(2026, 10, 30, tzinfo=UTC)
+    plan = lambda s, e: store._plan_segments(s, e, daily_end=de)  # noqa: E731
+    assert plan(datetime(2026, 10, 20, 15, tzinfo=UTC), datetime(2026, 10, 21, 10, tzinfo=UTC)) == [
+        ("HOURLY", "2026-10-20T15", "2026-10-21T09")]
+    assert plan(datetime(2026, 9, 30, 16, tzinfo=UTC), datetime(2026, 10, 14, 16, tzinfo=UTC)) == [  # UTC+8 Oct 1..14
+        ("HOURLY", "2026-09-30T16", "2026-09-30T23"), ("DAILY", "2026-10-01", "2026-10-13"),
+        ("HOURLY", "2026-10-14T00", "2026-10-14T15")]
+    assert plan(datetime(2026, 7, 1, tzinfo=UTC), datetime(2026, 7, 8, tzinfo=UTC)) == [("DAILY", "2026-07-01", "2026-07-07")]
+    assert plan(datetime(2026, 8, 31, 16, tzinfo=UTC), datetime(2026, 9, 30, 16, tzinfo=UTC)) == [  # UTC+8 September
+        ("HOURLY", "2026-08-31T16", "2026-08-31T23"), ("DAILY", "2026-09-01", "2026-09-29"),
+        ("HOURLY", "2026-09-30T00", "2026-09-30T15")]

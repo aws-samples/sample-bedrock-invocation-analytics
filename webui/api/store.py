@@ -34,84 +34,38 @@ def _cw():
 
 
 def _plan_segments(start_dt: datetime, end_dt: datetime, daily_end: datetime | None = None) -> list[tuple[str, str, str]]:
-    """Plan storage-tier segments for [start_dt, end_dt) — any input tz, output SKs are UTC.
+    """Plan storage-tier segments covering every UTC hour that overlaps [start_dt, end_dt).
 
-    The window is shaved progressively from both ends:
-      1. HOURLY head  — partial day at the start, until the next UTC midnight
-      2. DAILY head   — full UTC days, until the next UTC month boundary
-      3. MONTHLY      — full UTC months that are entirely within the window AND completed
-      4. DAILY tail   — full UTC days after the last completed month, until today (UTC) starts
-      5. HOURLY tail  — today's UTC hours up to e_utc
-
-    DAILY rows are read only before `daily_end` (exclusive; default today's UTC midnight) and MONTHLY only for
-    months ending by then; later days come from HOURLY. Callers pass the day after the pk's SETTLED watermark.
-    Returns a chronological list of (granularity, sk_start, sk_end) — empty if invalid.
+    HOURLY at the partial-day edges, DAILY for whole UTC days before `daily_end` (exclusive; default and cap is
+    today's UTC midnight; callers pass the day after the pk's SETTLED watermark), MONTHLY for whole UTC months inside
+    the DAILY span. Returns a chronological list of (granularity, sk_start, sk_end), inclusive; empty if invalid.
     """
-    s = start_dt.astimezone(timezone.utc)
-    e = end_dt.astimezone(timezone.utc)
+    s, e = start_dt.astimezone(timezone.utc), end_dt.astimezone(timezone.utc)
     if s >= e:
         return []
-
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    daily_end = min(daily_end or today_start, today_start)
-    cur_month_start = daily_end.replace(day=1)
+    h0 = s.replace(minute=0, second=0, microsecond=0)
+    h1 = e.replace(minute=0, second=0, microsecond=0)
+    if h1 < e:
+        h1 += timedelta(hours=1)  # exclusive end: the hour containing e is included
+    d0 = h0 if h0.hour == 0 else (h0 + timedelta(days=1)).replace(hour=0)
+    d1 = min(h1.replace(hour=0), daily_end or today_start, today_start)
 
-    segments: list[tuple[str, str, str]] = []
-    cursor = s  # advances toward e
+    def hourly(a: datetime, b: datetime):
+        return [("HOURLY", a.strftime("%Y-%m-%dT%H"), (b - timedelta(hours=1)).strftime("%Y-%m-%dT%H"))] if a < b else []
 
-    # ── 1. HOURLY head: from cursor up to the next UTC midnight (exclusive) ──
-    next_midnight = (cursor + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0) \
-        if (cursor.hour, cursor.minute, cursor.second, cursor.microsecond) != (0, 0, 0, 0) else cursor
-    if cursor < next_midnight:
-        head_end = min(next_midnight, e, today_start + timedelta(hours=1))  # don't cross today/end
-        segments.append(("HOURLY", cursor.strftime("%Y-%m-%dT%H"),
-                         (head_end - timedelta(hours=1)).strftime("%Y-%m-%dT%H")))
-        cursor = next_midnight
-        if cursor >= e:
-            return segments
+    def daily(a: datetime, b: datetime):
+        return [("DAILY", a.strftime("%Y-%m-%d"), (b - timedelta(days=1)).strftime("%Y-%m-%d"))] if a < b else []
 
-    # ── 2. DAILY head: full UTC days until the next month boundary (exclusive) or today ──
-    # Only run if cursor isn't already month-aligned — otherwise let MONTHLY take over.
-    if cursor.day != 1:
-        next_month = _next_month_start(cursor)
-        daily_head_end = min(next_month, daily_end, e)
-        if cursor < daily_head_end:
-            segments.append(("DAILY", cursor.strftime("%Y-%m-%d"),
-                             (daily_head_end - timedelta(days=1)).strftime("%Y-%m-%d")))
-            cursor = daily_head_end
-            if cursor >= e:
-                return segments
-
-    # ── 3. MONTHLY: only complete months that ended before the current UTC month ──
-    monthly_upper = min(cur_month_start, e)  # exclusive
-    if cursor.day == 1 and cursor < monthly_upper:
-        # cursor is at a UTC month start; monthly_upper is also a month start (or e)
-        # Last fully-included month is monthly_upper - 1 day's month
-        last_full_month_start = (monthly_upper - timedelta(days=1)).replace(day=1)
-        if cursor <= last_full_month_start:
-            segments.append(("MONTHLY", cursor.strftime("%Y-%m"),
-                             last_full_month_start.strftime("%Y-%m")))
-            cursor = _next_month_start(last_full_month_start)
-            if cursor >= e:
-                return segments
-
-    # ── 4. DAILY tail: full UTC days from cursor up to daily_end (exclusive) ──
-    daily_tail_end = min(daily_end, e)
-    if cursor < daily_tail_end:
-        segments.append(("DAILY", cursor.strftime("%Y-%m-%d"),
-                         (daily_tail_end - timedelta(days=1)).strftime("%Y-%m-%d")))
-        cursor = daily_tail_end
-        if cursor >= e:
-            return segments
-
-    # ── 5. HOURLY tail: hours from daily_end (or the head) up to e ──
-    if cursor < e:
-        # e_hour_inclusive: include the hour containing e (so an end_dt like 12:50 hits SK ...T12)
-        last_hour_inclusive = e if (e.minute, e.second, e.microsecond) == (0, 0, 0) else e + timedelta(hours=1)
-        segments.append(("HOURLY", cursor.strftime("%Y-%m-%dT%H"),
-                         (last_hour_inclusive - timedelta(hours=1)).strftime("%Y-%m-%dT%H")))
-
-    return segments
+    if d0 >= d1:
+        return hourly(h0, h1)
+    m0 = d0 if d0.day == 1 else _next_month_start(d0)
+    m1 = d1.replace(day=1)
+    if m0 < m1:
+        middle = daily(d0, m0) + [("MONTHLY", m0.strftime("%Y-%m"), (m1 - timedelta(days=1)).strftime("%Y-%m"))] + daily(m1, d1)
+    else:
+        middle = daily(d0, d1)
+    return hourly(h0, d0) + middle + hourly(d1, h1)
 
 
 def _next_month_start(dt: datetime) -> datetime:
