@@ -3,7 +3,13 @@
 @media (min-width: 900px) { .summary-cards { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
 @media (min-width: 1500px) { .summary-cards { grid-template-columns: repeat(8, minmax(0, 1fr)); } }
 .summary-card-label { display: flex; align-items: flex-start; gap: 6px; min-width: 0; }
-.summary-card { display: flex; flex-direction: column; justify-content: space-between; height: 100%; }
+.summary-card { display: flex; flex-direction: column; justify-content: space-between; height: 100%; box-sizing: border-box;
+  padding: 20px; border-radius: 16px; }
+/* Tint by what the card measures; padding and radius match a Cloudscape container, whose own padding is disabled. */
+.summary-card--tokens { background: #eef6fd; }
+.summary-card--requests { background: #f3f0fd; }
+.summary-card--cost { background: #fef6e6; }
+.summary-card--speed { background: #ebf7f4; }
 /* Figures from the previous filter selection, shown dimmed until the new ones load. */
 .summary-cards { transition: opacity 0.15s; }
 .summary-cards.is-loading { opacity: 0.45; }

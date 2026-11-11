@@ -22,6 +22,8 @@ import { formatCost, formatInTz, formatMs, formatNumber, shortModel } from '../f
 
 const TOTAL: SelectProps.Option = { value: 'TOTAL', label: 'All' }
 
+type CardKind = 'tokens' | 'requests' | 'cost' | 'speed'
+
 // Dismissing the unpriced banner hides it until the page is reloaded, or until the set of unpriced models changes.
 // Module scope, so it survives navigating to the Pricing page and back.
 let dismissedUnpriced = ''
@@ -84,15 +86,16 @@ export default function Dashboard({ status }: { status?: Status }) {
   const summary = data?.summary
   // Token counts first, then requests, cost and speed, so each group fills one row of four.
   // Blue = sent to the model / written to the cache, green = returned by the model / read from the cache.
-  const cards: [string, string, IconProps.Name | keyof typeof CUSTOM_ICONS, IconProps.Variant][] | undefined = summary && [
-    ['Input tokens', formatNumber(summary.input_tokens), 'upload', 'link'],
-    ['Output tokens', formatNumber(summary.output_tokens), 'download', 'success'],
-    ['Cache write tokens', formatNumber(summary.cache_write_tokens), 'cache-write', 'link'],
-    ['Cache read tokens', formatNumber(summary.cache_read_tokens), 'cache-read', 'success'],
-    ['Total invocations', formatNumber(summary.invocations), 'send', 'link'],
-    ['Estimated cost', formatCost(summary.cost_usd), 'cost', 'warning'],
-    ['Avg latency', formatMs(summary.avg_latency_ms), 'status-pending', 'subtle'],
-    ['Avg TPOT', `${summary.avg_tpot.toFixed(2)}ms`, 'speed', 'subtle'],
+  // The last field tints the card by what it measures.
+  const cards: [string, string, IconProps.Name | keyof typeof CUSTOM_ICONS, IconProps.Variant, CardKind][] | undefined = summary && [
+    ['Input tokens', formatNumber(summary.input_tokens), 'upload', 'link', 'tokens'],
+    ['Output tokens', formatNumber(summary.output_tokens), 'download', 'success', 'tokens'],
+    ['Cache write tokens', formatNumber(summary.cache_write_tokens), 'cache-write', 'link', 'tokens'],
+    ['Cache read tokens', formatNumber(summary.cache_read_tokens), 'cache-read', 'success', 'tokens'],
+    ['Total invocations', formatNumber(summary.invocations), 'send', 'link', 'requests'],
+    ['Estimated cost', formatCost(summary.cost_usd), 'cost', 'warning', 'cost'],
+    ['Avg latency', formatMs(summary.avg_latency_ms), 'status-pending', 'subtle', 'speed'],
+    ['Avg TPOT', `${summary.avg_tpot.toFixed(2)}ms`, 'speed', 'subtle', 'speed'],
   ]
   const rangeText = params && `${formatInTz(params.start, tzName, true)} → ${formatInTz(params.end, tzName, true)}`
 
@@ -150,9 +153,9 @@ export default function Dashboard({ status }: { status?: Status }) {
         {data && cards && (
           <SpaceBetween size="l">
             <div className={stale ? 'summary-cards is-loading' : 'summary-cards'} aria-busy={stale}>
-              {cards.map(([title, value, icon, variant]) => (
-                <Container key={title} fitHeight>
-                  <div className="summary-card">
+              {cards.map(([title, value, icon, variant, kind]) => (
+                <Container key={title} fitHeight disableContentPaddings>
+                  <div className={`summary-card summary-card--${kind}`}>
                     <div className="summary-card-label">
                       {icon in CUSTOM_ICONS ? <Icon svg={CUSTOM_ICONS[icon as keyof typeof CUSTOM_ICONS]} variant={variant} />
                         : <Icon name={icon as IconProps.Name} variant={variant} />}
@@ -165,9 +168,6 @@ export default function Dashboard({ status }: { status?: Status }) {
                 </Container>
               ))}
             </div>
-
-            <UsageBreakdown title="Token usage and cost by model" rows={models} nameKey="model" nameHeader="Model" loading={stale} />
-            <UsageBreakdown title="Token usage and cost by caller" rows={data.callers} nameKey="caller" nameHeader="Caller" loading={stale} />
 
             <Container header={
               <Header variant="h2" actions={
@@ -182,12 +182,13 @@ export default function Dashboard({ status }: { status?: Status }) {
               {usageTrendOption ? <EChart option={usageTrendOption} loading={usageTrendData.loading} ariaLabel="Usage trend" /> : <Spinner />}
             </Container>
 
+            <UsageBreakdown title="Token usage and cost by model" rows={models} nameKey="model" nameHeader="Model" loading={stale} />
+            <UsageBreakdown title="Token usage and cost by caller" rows={data.callers} nameKey="caller" nameHeader="Caller" loading={stale} />
+
+            {/* Rows pair a per-model snapshot with its trend: latency, then TPOT with TTFT. */}
             <Grid gridDefinition={Array.from({ length: 4 }, () => ({ colspan: { default: 12, m: 6 } }))}>
               <Container header={<Header variant="h2">Latency by model</Header>}>
                 <EChart option={charts!.latency} loading={stale} ariaLabel="Latency by model" />
-              </Container>
-              <Container header={<Header variant="h2" description="Latency divided by output tokens">TPOT by model (approx.)</Header>}>
-                <EChart option={charts!.tpot} loading={stale} ariaLabel="TPOT by model" />
               </Container>
               <Container header={
                 <Header variant="h2" actions={
@@ -196,6 +197,9 @@ export default function Dashboard({ status }: { status?: Status }) {
                 }>Latency trend</Header>
               }>
                 {latencyTrendOption ? <EChart option={latencyTrendOption} loading={latencyTrendData.loading} ariaLabel="Latency trend" /> : <Spinner />}
+              </Container>
+              <Container header={<Header variant="h2" description="Latency divided by output tokens">TPOT by model (approx.)</Header>}>
+                <EChart option={charts!.tpot} loading={stale} ariaLabel="TPOT by model" />
               </Container>
               <Container header={
                 <Header variant="h2" description="From CloudWatch AWS/Bedrock TimeToFirstToken" actions={
