@@ -195,6 +195,21 @@ def test_plan_segments_uses_coarsest_complete_tiers():
                     ("MONTHLY", "2026-09", "2026-09"), ("DAILY", "2026-10-01", "2026-10-02")]
 
 
+def test_daily_trend_reads_days_not_the_monthly_rollup(monkeypatch):
+    """A 'this quarter' span (DAILY display) must chart each day of a whole past month, not one bar for the month."""
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("Asia/Shanghai")
+    seen = []
+    monkeypatch.setattr(store, "daily_end_for", lambda pk: datetime(2026, 11, 11, tzinfo=timezone.utc))
+    monkeypatch.setattr(store, "query_usage", lambda pk, segs, *a, **k: seen.append(segs) or [])
+    start, end = datetime(2026, 10, 1, tzinfo=tz), datetime(2026, 11, 11, 22, tzinfo=tz)
+    store.get_dashboard_bundle("111122223333#us-west-2", start, end, tz)
+    store.get_trend("111122223333#us-west-2", start, end, "TOTAL", tz)
+    assert all(g != "MONTHLY" for segs in seen for g, _, _ in segs)
+    assert ("DAILY", "2026-10-01", "2026-11-10") in seen[0]
+
+
 def test_rebucket_groups_hours_into_local_days():
     from zoneinfo import ZoneInfo
     rows = [{"period": "2026-10-27T15", "granularity": "HOURLY", "invocations": 1, "cost_micro_usd": 1_000_000},

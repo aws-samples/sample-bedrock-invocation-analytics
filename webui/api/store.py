@@ -44,12 +44,14 @@ def _cw():
     return _clients["cw"]
 
 
-def _plan_segments(start_dt: datetime, end_dt: datetime, daily_end: datetime | None = None) -> list[tuple[str, str, str]]:
+def _plan_segments(start_dt: datetime, end_dt: datetime, daily_end: datetime | None = None,
+                   monthly: bool = True) -> list[tuple[str, str, str]]:
     """Plan storage-tier segments covering every UTC hour that overlaps [start_dt, end_dt).
 
     HOURLY at the partial-day edges, DAILY for whole UTC days before `daily_end` (exclusive; default and cap is
     today's UTC midnight; callers pass the day after the pk's SETTLED watermark), MONTHLY for whole UTC months inside
-    the DAILY span. Returns a chronological list of (granularity, sk_start, sk_end), inclusive; empty if invalid.
+    the DAILY span unless `monthly` is False (a daily or hourly series can't split a MONTHLY row back into days).
+    Returns a chronological list of (granularity, sk_start, sk_end), inclusive; empty if invalid.
     """
     s, e = start_dt.astimezone(timezone.utc), end_dt.astimezone(timezone.utc)
     if s >= e:
@@ -72,7 +74,7 @@ def _plan_segments(start_dt: datetime, end_dt: datetime, daily_end: datetime | N
         return hourly(h0, h1)
     m0 = d0 if d0.day == 1 else _next_month_start(d0)
     m1 = d1.replace(day=1)
-    if m0 < m1:
+    if monthly and m0 < m1:
         middle = daily(d0, m0) + [("MONTHLY", m0.strftime("%Y-%m"), (m1 - timedelta(days=1)).strftime("%Y-%m"))] + daily(m1, d1)
     else:
         middle = daily(d0, d1)
@@ -198,13 +200,15 @@ TOKEN_FIELDS = ("invocations", "input_tokens", "output_tokens", "cache_read_toke
 
 def get_dashboard_bundle(account_region: str, start_dt: datetime, end_dt: datetime, tz: tzinfo | None = None) -> dict:
     """Summary, by-model, by-caller and TOTAL trend from a single pass over the storage segments."""
-    items = query_usage(account_region, _plan_segments(start_dt, end_dt, daily_end_for(account_region)))
+    target = _pick_display_granularity(start_dt, end_dt)
+    items = query_usage(account_region, _plan_segments(start_dt, end_dt, daily_end_for(account_region),
+                                                       monthly=target == "MONTHLY"))
     totals = [i for i in items if i["dimension"] == "TOTAL"]
     return {
         "summary": summarize(totals),
         "models": group_by_model([i for i in items if i["dimension"].startswith("MODEL#")]),
         "callers": group_by_caller([i for i in items if i["dimension"].startswith("CALLER#")]),
-        "trend_total": _rebucket(totals, _pick_display_granularity(start_dt, end_dt), tz or timezone.utc),
+        "trend_total": _rebucket(totals, target, tz or timezone.utc),
     }
 
 
@@ -280,7 +284,8 @@ def get_trend(account_region: str, start_dt: datetime, end_dt: datetime,
     UTC-bucketed storage.
     """
     target = _pick_display_granularity(start_dt, end_dt)
-    items = query_usage(account_region, _plan_segments(start_dt, end_dt, daily_end_for(account_region)), dimension, exact=True)
+    items = query_usage(account_region, _plan_segments(start_dt, end_dt, daily_end_for(account_region),
+                                                       monthly=target == "MONTHLY"), dimension, exact=True)
     return _rebucket(items, target, tz or timezone.utc)
 
 

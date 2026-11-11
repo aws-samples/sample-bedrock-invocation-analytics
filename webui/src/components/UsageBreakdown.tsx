@@ -19,9 +19,10 @@ interface Props<T extends UsageRow> {
   rows: T[]
   nameKey: keyof T & string
   nameHeader: string
+  loading?: boolean
 }
 
-export default function UsageBreakdown<T extends UsageRow>({ title, rows, nameKey, nameHeader }: Props<T>) {
+export default function UsageBreakdown<T extends UsageRow>({ title, rows, nameKey, nameHeader, loading = false }: Props<T>) {
   const label = (row: T) => String(row[nameKey])
   const barOption = useMemo(() => {
     const top = rows.slice(0, TOP_BARS)
@@ -60,17 +61,18 @@ export default function UsageBreakdown<T extends UsageRow>({ title, rows, nameKe
     <Container header={<Header variant="h2" counter={`(${rows.length})`}>{title}</Header>} disableContentPaddings={false}>
       <Tabs
         tabs={[
-          { id: 'chart', label: 'Chart', content: <EChart option={barOption} height={400} ariaLabel={`${title}: tokens and cost`} /> },
+          { id: 'chart', label: 'Chart', content: <EChart option={barOption} height={400} loading={loading} ariaLabel={`${title}: tokens and cost`} /> },
           {
             id: 'pie', label: 'Pie', content: (
               <ColumnLayout columns={3}>
-                {pies.map((option, i) => <EChart key={i} option={option} height={320} ariaLabel={`${title}: share`} />)}
+                {pies.map((option, i) => <EChart key={i} option={option} height={320} loading={loading} ariaLabel={`${title}: share`} />)}
               </ColumnLayout>
             ),
           },
           {
             id: 'table', label: 'Table', content: (
               <Table {...collectionProps} items={items} columnDefinitions={columns} variant="embedded" stickyHeader
+                loading={loading} loadingText="Loading usage"
                 empty={<Box textAlign="center" color="inherit">No usage in this range</Box>} />
             ),
           },

@@ -13,7 +13,7 @@ import Link from '@cloudscape-design/components/link'
 import Select, { type SelectProps } from '@cloudscape-design/components/select'
 import SpaceBetween from '@cloudscape-design/components/space-between'
 import Spinner from '@cloudscape-design/components/spinner'
-import { api, MODEL_KINDS, REPRICE_ACTIVE, type Status, type UnpricedModel } from '../api'
+import { api, MODEL_KINDS, REPRICE_ACTIVE, type Status, type TrendPoint, type UnpricedModel } from '../api'
 import EChart from '../components/EChart'
 import UsageBreakdown from '../components/UsageBreakdown'
 import { latencyTrend, minAvgMaxBar, ttftTrend, usageTrend } from '../components/charts'
@@ -38,29 +38,37 @@ export default function Dashboard({ status }: { status?: Status }) {
 
   const dashboard = useQuery({ queryKey: ['dashboard', params], queryFn: () => api.dashboard(params!), enabled: !!params, placeholderData: (prev) => prev })
   const data = dashboard.data
+  // After a filter change the previous range stays on screen, under a loading mask, until the new one arrives.
+  const stale = dashboard.isPlaceholderData
   const models = data?.models ?? []
   const modelOptions = [TOTAL, ...models.map((m) => ({ value: `MODEL#${m.model}`, label: m.model }))]
   const callerOptions = [TOTAL, ...(data?.callers ?? []).map((c) => ({ value: `CALLER#${c.caller}`, label: c.caller }))]
 
+  // "All" comes with the dashboard response, so it changes together with it; a model or caller needs its own request.
   const usageDim = usageModel.value !== 'TOTAL' ? usageModel.value! : usageCaller.value!
   const trendQuery = (dim: string) => ({
     queryKey: ['trend', params, dim],
-    queryFn: () => (dim === 'TOTAL' ? Promise.resolve(data!.trend_total) : api.trend(params!, dim)),
-    enabled: !!params && !!data,
-    placeholderData: (prev: unknown) => prev,
+    queryFn: () => api.trend(params!, dim),
+    enabled: !!params && dim !== 'TOTAL',
+    placeholderData: (prev: TrendPoint[] | undefined) => prev,
   })
-  const usageTrendData = useQuery({ ...trendQuery(usageDim), placeholderData: undefined })
-  const latencyTrendData = useQuery({ ...trendQuery(latencyModel.value!), placeholderData: undefined })
+  const usageTrendQuery = useQuery(trendQuery(usageDim))
+  const latencyTrendQuery = useQuery(trendQuery(latencyModel.value!))
+  const trendOf = (dim: string, q: typeof usageTrendQuery) =>
+    dim === 'TOTAL' ? { points: data?.trend_total, loading: stale } : { points: q.data, loading: q.isPlaceholderData }
+  const usageTrendData = trendOf(usageDim, usageTrendQuery)
+  const latencyTrendData = trendOf(latencyModel.value!, latencyTrendQuery)
 
   const ttftSelected = ttftModel ?? (models[0] ? { value: models[0].model, label: models[0].model } : null)
   const ttft = useQuery({
     queryKey: ['ttft', ttftSelected?.value, params?.start, params?.end],
     queryFn: () => api.ttft(ttftSelected!.value!, params!.start, params!.end),
     enabled: !!params && !!ttftSelected,
+    placeholderData: (prev) => prev,
   })
   const spanDays = params ? (Date.parse(params.end) - Date.parse(params.start)) / 864e5 : 0
-  const usageTrendOption = useMemo(() => usageTrendData.data && usageTrend(usageTrendData.data), [usageTrendData.data])
-  const latencyTrendOption = useMemo(() => latencyTrendData.data && latencyTrend(latencyTrendData.data), [latencyTrendData.data])
+  const usageTrendOption = useMemo(() => usageTrendData.points && usageTrend(usageTrendData.points), [usageTrendData.points])
+  const latencyTrendOption = useMemo(() => latencyTrendData.points && latencyTrend(latencyTrendData.points), [latencyTrendData.points])
   const ttftOption = useMemo(() => ttft.data && ttftTrend(ttft.data, tzName, spanDays > 1), [ttft.data, tzName, spanDays])
 
   const charts = useMemo(() => {
@@ -141,7 +149,7 @@ export default function Dashboard({ status }: { status?: Status }) {
 
         {data && cards && (
           <SpaceBetween size="l">
-            <div className="summary-cards">
+            <div className={stale ? 'summary-cards is-loading' : 'summary-cards'} aria-busy={stale}>
               {cards.map(([title, value, icon, variant]) => (
                 <Container key={title} fitHeight>
                   <div className="summary-card">
@@ -158,8 +166,8 @@ export default function Dashboard({ status }: { status?: Status }) {
               ))}
             </div>
 
-            <UsageBreakdown title="Token usage and cost by model" rows={models} nameKey="model" nameHeader="Model" />
-            <UsageBreakdown title="Token usage and cost by caller" rows={data.callers} nameKey="caller" nameHeader="Caller" />
+            <UsageBreakdown title="Token usage and cost by model" rows={models} nameKey="model" nameHeader="Model" loading={stale} />
+            <UsageBreakdown title="Token usage and cost by caller" rows={data.callers} nameKey="caller" nameHeader="Caller" loading={stale} />
 
             <Container header={
               <Header variant="h2" actions={
@@ -171,15 +179,15 @@ export default function Dashboard({ status }: { status?: Status }) {
                 </SpaceBetween>
               }>Usage trend</Header>
             }>
-              {usageTrendOption ? <EChart option={usageTrendOption} ariaLabel="Usage trend" /> : <Spinner />}
+              {usageTrendOption ? <EChart option={usageTrendOption} loading={usageTrendData.loading} ariaLabel="Usage trend" /> : <Spinner />}
             </Container>
 
             <Grid gridDefinition={Array.from({ length: 4 }, () => ({ colspan: { default: 12, m: 6 } }))}>
               <Container header={<Header variant="h2">Latency by model</Header>}>
-                <EChart option={charts!.latency} ariaLabel="Latency by model" />
+                <EChart option={charts!.latency} loading={stale} ariaLabel="Latency by model" />
               </Container>
               <Container header={<Header variant="h2" description="Latency divided by output tokens">TPOT by model (approx.)</Header>}>
-                <EChart option={charts!.tpot} ariaLabel="TPOT by model" />
+                <EChart option={charts!.tpot} loading={stale} ariaLabel="TPOT by model" />
               </Container>
               <Container header={
                 <Header variant="h2" actions={
@@ -187,7 +195,7 @@ export default function Dashboard({ status }: { status?: Status }) {
                     onChange={(e) => setLatencyModel(e.detail.selectedOption)} />
                 }>Latency trend</Header>
               }>
-                {latencyTrendOption ? <EChart option={latencyTrendOption} ariaLabel="Latency trend" /> : <Spinner />}
+                {latencyTrendOption ? <EChart option={latencyTrendOption} loading={latencyTrendData.loading} ariaLabel="Latency trend" /> : <Spinner />}
               </Container>
               <Container header={
                 <Header variant="h2" description="From CloudWatch AWS/Bedrock TimeToFirstToken" actions={
@@ -195,7 +203,7 @@ export default function Dashboard({ status }: { status?: Status }) {
                     filteringType="auto" ariaLabel="Model" placeholder="Model" onChange={(e) => setTtftModel(e.detail.selectedOption)} />
                 }>TTFT trend</Header>
               }>
-                {ttftOption ? <EChart option={ttftOption} ariaLabel="TTFT trend" /> : <Spinner />}
+                {ttftOption ? <EChart option={ttftOption} loading={ttft.isPlaceholderData} ariaLabel="TTFT trend" /> : <Spinner />}
               </Container>
             </Grid>
           </SpaceBetween>

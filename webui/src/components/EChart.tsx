@@ -12,10 +12,11 @@ interface Props {
   option: ChartOption
   height?: number
   ariaLabel: string
+  loading?: boolean  // keeps the current chart under a loading mask while newer data is on its way
 }
 
 /** Thin ECharts wrapper: one instance per element, resized with its container, options replaced on change. */
-export default function EChart({ option, height = 360, ariaLabel }: Props) {
+export default function EChart({ option, height = 360, ariaLabel, loading = false }: Props) {
   const ref = useRef<HTMLDivElement>(null)
   const chart = useRef<echarts.ECharts | null>(null)
 
@@ -36,5 +37,10 @@ export default function EChart({ option, height = 360, ariaLabel }: Props) {
     chart.current?.setOption({ aria: { enabled: true }, ...option }, { notMerge: true })
   }, [option])
 
-  return <div ref={ref} role="img" aria-label={ariaLabel} style={{ width: '100%', height }} />
+  useEffect(() => {
+    if (loading) chart.current?.showLoading('default', { text: '', color: '#0972d3', maskColor: 'rgba(255, 255, 255, 0.6)' })
+    else chart.current?.hideLoading()
+  }, [loading])
+
+  return <div ref={ref} role="img" aria-label={ariaLabel} aria-busy={loading} style={{ width: '100%', height }} />
 }
