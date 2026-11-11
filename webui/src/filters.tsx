@@ -16,6 +16,28 @@ const TZ_OPTIONS: SelectProps.Option[] = LOCAL_TZ === 'UTC'
 const REFRESH_OPTIONS: SelectProps.Option[] = [
   { value: '0', label: 'Off' }, { value: '60', label: 'Every 1 minute' }, { value: '300', label: 'Every 5 minutes' },
 ]
+const RANGE_KEY = 'timeRange'
+const RANGE_UNITS = ['second', 'minute', 'hour', 'day', 'week', 'month', 'year']
+
+/** The range last applied in this browser, or DEFAULT_RANGE when none was saved or the saved one is unusable. */
+function savedRange(): DateRangePickerProps.Value {
+  try {
+    const v = JSON.parse(localStorage.getItem(RANGE_KEY) ?? 'null')
+    if (v?.type === 'relative') {
+      const preset = RELATIVE_OPTIONS.find((o) => o.key === v.key)
+      if (preset) return preset
+      if (!v.key && Number.isInteger(v.amount) && v.amount > 0 && RANGE_UNITS.includes(v.unit)) {
+        return { type: 'relative', amount: v.amount, unit: v.unit }
+      }
+    }
+    if (v?.type === 'absolute' && typeof v.startDate === 'string' && typeof v.endDate === 'string' && validateRange(v).valid) {
+      return { type: 'absolute', startDate: v.startDate, endDate: v.endDate }
+    }
+  } catch {
+    // corrupt entry: fall through to the default
+  }
+  return DEFAULT_RANGE
+}
 
 /** Current time, advanced every `seconds` (0 = only on demand). Relative ranges are resolved against it. */
 function useNow(seconds: number) {
@@ -32,7 +54,11 @@ function useNow(seconds: number) {
 export function FiltersProvider({ children }: { children: ReactNode }) {
   const [accountId, setAccountId] = useState<string | null>(null)
   const [region, setRegion] = useState<string | null>(null)
-  const [range, setRange] = useState<DateRangePickerProps.Value>(DEFAULT_RANGE)
+  const [range, setRange] = useState<DateRangePickerProps.Value>(savedRange)
+  const applyRange = (value: DateRangePickerProps.Value) => {
+    setRange(value)
+    localStorage.setItem(RANGE_KEY, JSON.stringify(value))
+  }
   const [tz, setTz] = useState<SelectProps.Option>(TZ_OPTIONS[0])
   const [refresh, setRefresh] = useState<SelectProps.Option>(REFRESH_OPTIONS[0])
   const [now, refreshNow] = useNow(Number(refresh.value))
@@ -66,7 +92,7 @@ export function FiltersProvider({ children }: { children: ReactNode }) {
           <Select selectedOption={selectedRegion} options={regionOptions} placeholder="—" onChange={(e) => setRegion(e.detail.selectedOption.value!)} />
         </FormField>
         <FormField label="Time range">
-          <DateRangePicker value={range} onChange={(e) => e.detail.value && setRange(e.detail.value)} relativeOptions={RELATIVE_OPTIONS}
+          <DateRangePicker value={range} onChange={(e) => e.detail.value && applyRange(e.detail.value)} relativeOptions={RELATIVE_OPTIONS}
             isValidRange={validateRange} dateOnly rangeSelectorMode="default" placeholder="Time range" expandToViewport
             i18nStrings={{ ariaLabel: 'Time range', formatRelativeRange }} />
         </FormField>
