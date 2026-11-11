@@ -221,6 +221,7 @@ scripts/rebuild_costs.sh --all
 | `cloudfront: true` | 在内部 ALB 前加一个 CloudFront 分发（VPC origin）。访问输出里的 `WebUiUrl`（`https://<id>.cloudfront.net`）。ALB 本身始终不暴露到公网。 |
 | `allowed_cidrs` | 允许直接访问内部 ALB（`WebUiAlbDnsName`）的内网网段（VPN、办公网、对等 VPC）。 |
 | `certificate_arn` | ALB 的 HTTPS 证书（443 端口）。不填时直连 ALB 走明文 HTTP 80 端口，部署时会给出警告。 |
+| `domain_name`、`cloudfront_certificate_arn` | 让 CloudFront 使用自定义域名。证书必须在 us-east-1 并覆盖该域名。栈不管理 DNS：需自行添加从该域名指向 `WebUiCloudFrontDomain` 的 CNAME（或 Route 53 Alias）记录。 |
 | `vpc_id`、`subnet_ids` | 使用已有 VPC，以及至少两个不同可用区的私有子网。开 CloudFront 时 VPC 需要有 Internet Gateway。留空则新建一个最小 VPC。 |
 | `cognito_user_pool_id` | 沿用本账号已有的 pool（任意区域），栈只在其中新增一个 app client。留空则新建 pool。 |
 | `admin_group` | 可编辑定价的用户组，其他已登录用户只读。留空则由栈创建 `bedrock-analytics-admin`。 |

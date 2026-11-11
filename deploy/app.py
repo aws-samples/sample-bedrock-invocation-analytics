@@ -39,6 +39,8 @@ def webui_config(section: dict, account_names: dict[str, str]) -> WebUiConfig:
         vpc_id=section.get("vpc_id") or "",
         allowed_cidrs=list(section.get("allowed_cidrs") or []),
         certificate_arn=section.get("certificate_arn") or "",
+        domain_name=section.get("domain_name") or "",
+        cloudfront_certificate_arn=section.get("cloudfront_certificate_arn") or "",
         cognito_user_pool_id=section.get("cognito_user_pool_id") or "",
         initial_admin_email=section.get("initial_admin_email") or "",
         admin_group=section.get("admin_group") or "",
@@ -46,6 +48,11 @@ def webui_config(section: dict, account_names: dict[str, str]) -> WebUiConfig:
     )
     if not cfg.cloudfront and not cfg.allowed_cidrs:
         raise ValueError("webui: set cloudfront: true or list allowed_cidrs, otherwise nobody can reach the WebUI")
+    if cfg.domain_name or cfg.cloudfront_certificate_arn:
+        if not (cfg.cloudfront and cfg.domain_name and cfg.cloudfront_certificate_arn):
+            raise ValueError("webui.domain_name needs cloudfront: true and cloudfront_certificate_arn")
+        if cfg.cloudfront_certificate_arn.split(":")[3:4] != ["us-east-1"]:
+            raise ValueError("webui.cloudfront_certificate_arn must be an ACM certificate in us-east-1 (CloudFront requirement)")
     ec2 = boto3.Session(profile_name=primary["profile"], region_name=primary["region"]).client("ec2")
     if cfg.vpc_id:
         subnet_ids = list(section.get("subnet_ids") or [])

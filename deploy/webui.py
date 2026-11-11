@@ -46,6 +46,8 @@ class WebUiConfig:
     subnets: list[dict] = field(default_factory=list)  # [{"subnet_id", "availability_zone"}] when vpc_id is set
     allowed_cidrs: list[str] = field(default_factory=list)
     certificate_arn: str = ""
+    domain_name: str = ""  # custom CloudFront domain; DNS is managed outside the stack
+    cloudfront_certificate_arn: str = ""  # us-east-1 ACM certificate covering domain_name
     cognito_user_pool_id: str = ""
     admin_group: str = ""  # existing group to reuse; empty = the stack creates DEFAULT_ADMIN_GROUP
     initial_admin_email: str = ""
@@ -117,8 +119,8 @@ class WebUi(Construct):
 
         url = f"{'https' if https else 'http'}://{alb.load_balancer_dns_name}"
         if config.cloudfront:
-            distribution = self._cloudfront(alb)
-            url = f"https://{distribution.distribution_domain_name}"
+            distribution = self._cloudfront(alb, config)
+            url = f"https://{config.domain_name or distribution.distribution_domain_name}"
             CfnOutput(stack, "WebUiCloudFrontDomain", value=distribution.distribution_domain_name)
         CfnOutput(stack, "WebUiUrl", value=url)
         CfnOutput(stack, "WebUiAlbDnsName", value=alb.load_balancer_dns_name)
@@ -229,7 +231,7 @@ class WebUi(Construct):
                    for i, s in enumerate(config.subnets)]
         return vpc, ec2.SubnetSelection(subnets=subnets)
 
-    def _cloudfront(self, alb: elbv2.ApplicationLoadBalancer) -> cloudfront.Distribution:
+    def _cloudfront(self, alb: elbv2.ApplicationLoadBalancer, config: WebUiConfig) -> cloudfront.Distribution:
         origin = origins.VpcOrigin.with_application_load_balancer(
             alb, protocol_policy=cloudfront.OriginProtocolPolicy.HTTP_ONLY, http_port=80,
             read_timeout=Duration.seconds(30))
@@ -249,11 +251,19 @@ class WebUi(Construct):
             cache_policy=cloudfront.CachePolicy.CACHING_OPTIMIZED,
             response_headers_policy=cloudfront.ResponseHeadersPolicy.SECURITY_HEADERS,
         )
+        custom_domain = {}
+        if config.domain_name:
+            custom_domain = {
+                "domain_names": [config.domain_name],
+                "certificate": acm.Certificate.from_certificate_arn(self, "CloudFrontCertificate",
+                                                                    config.cloudfront_certificate_arn),
+            }
         return cloudfront.Distribution(
             self, "Distribution",
             comment=f"{Stack.of(self).stack_name} WebUI",
             default_behavior=dynamic,
             additional_behaviors={"/assets/*": assets},
+            **custom_domain,
             price_class=cloudfront.PriceClass.PRICE_CLASS_100,
             http_version=cloudfront.HttpVersion.HTTP2_AND_3,
             minimum_protocol_version=cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,

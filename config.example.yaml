@@ -19,6 +19,8 @@ webui:
   subnet_ids: []             # private subnets for the ALB when vpc_id is set (2+ AZs)
   allowed_cidrs: []          # intranet ranges allowed to reach the ALB directly (VPN, office network)
   certificate_arn: ""        # optional ACM certificate; enables 443 HTTPS for direct ALB access (otherwise plaintext HTTP 80)
+  domain_name: ""            # optional custom domain for CloudFront, e.g. analytics.example.com; point its DNS at WebUiCloudFrontDomain yourself
+  cloudfront_certificate_arn: ""  # required with domain_name: ACM certificate in us-east-1 covering it
   cognito_user_pool_id: ""   # empty = create a user pool; set to reuse an existing one
   initial_admin_email: ""    # created pool only: first admin, temporary password sent by email
   admin_group: bedrock-analytics-admin    # group whose members can edit pricing; empty = the stack creates bedrock-analytics-admin. Everyone else is read-only

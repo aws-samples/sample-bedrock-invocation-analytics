@@ -222,6 +222,7 @@ To check that DynamoDB matches Iceberg (invocations, tokens, latency, cost, TPOT
 | `cloudfront: true` | Adds a CloudFront distribution in front of the internal ALB (VPC origin). Open the `WebUiUrl` output (`https://<id>.cloudfront.net`). The ALB itself is never internet-facing. |
 | `allowed_cidrs` | Intranet ranges (VPN, office, peered VPCs) allowed to reach the internal ALB directly at `WebUiAlbDnsName`. |
 | `certificate_arn` | ACM certificate for HTTPS on the ALB (port 443). Without it, direct ALB access is plaintext HTTP on port 80 and deploy prints a warning. |
+| `domain_name`, `cloudfront_certificate_arn` | Serve CloudFront on your own domain. The certificate must be in us-east-1 and cover the domain. The stack doesn't manage DNS: add a CNAME (or Route 53 alias) from the domain to `WebUiCloudFrontDomain`. |
 | `vpc_id`, `subnet_ids` | Use your VPC and two or more private subnets in different AZs. With CloudFront the VPC needs an internet gateway. Empty = a minimal VPC is created. |
 | `cognito_user_pool_id` | Reuse an existing pool in the same account (any region); the stack only adds an app client. Empty = a pool is created. |
 | `admin_group` | Group whose members can edit pricing. Every other signed-in user is read-only. Empty = the stack creates `bedrock-analytics-admin`. |
